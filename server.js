@@ -9,8 +9,8 @@ const path = require('path');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'djassa_ci_secret_key_2024';
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
@@ -900,6 +900,5 @@ app.get('/api/health', (req, res) => {
 // ==================== START SERVER ====================
 
 app.listen(PORT, () => {
-    console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
-    console.log(`📡 API available at http://localhost:${PORT}/api`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
