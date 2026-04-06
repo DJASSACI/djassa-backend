@@ -1,0 +1,22 @@
+[
+  {
+    "id": 1774811941531,
+    "nom": "massa",
+    "prenom": "mouss",
+    "numero": "0777380334",
+    "address": "soubrer",
+    "password": "massa bb",
+    "role": "user",
+    "dateInscription": "2026-03-29T19:19:01.531Z"
+  },
+  {
+    "id": 1774815580226,
+    "nom": "mawa",
+    "prenom": "maka",
+    "numero": "0715926401",
+    "address": "soubrer",
+    "password": "mawa bb",
+    "role": "user",
+    "dateInscription": "2026-03-29T20:19:40.227Z"
+  }
+]
