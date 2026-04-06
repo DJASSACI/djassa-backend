@@ -897,6 +897,12 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// CinetPay webhook
+app.post('/notify', (req, res) => {
+    console.log('🔔 CinetPay notification:', req.body);
+    res.send('OK');
+});
+
 // ==================== START SERVER ====================
 
 app.listen(PORT, () => {
