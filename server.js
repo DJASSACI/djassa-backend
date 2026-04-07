@@ -558,7 +558,12 @@ app.post('/api/orders', authenticateToken, (req, res) => {
             return res.status(400).json({ error: 'Payment information is required' });
         }
 
-        const total = items.reduce((sum, item) => sum + (item.price * item.quantite), 0);
+        const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantite), 0);
+
+        const commissionRate = 0.05;
+        const commission = subtotal * commissionRate;
+
+        const total = subtotal + commission;
 
         const orders = readJSONFile(ORDERS_FILE);
 
@@ -569,6 +574,7 @@ app.post('/api/orders', authenticateToken, (req, res) => {
             total,
             date: new Date().toISOString(),
             statut: 'Payée',
+            statutVendeur: 'a_payer_vendeur',
             methodePaiement: paymentMethod,
             numeroPaiement: phoneNumber,
             nomCompte: accountName
@@ -579,7 +585,8 @@ app.post('/api/orders', authenticateToken, (req, res) => {
 
         res.status(201).json({
             message: 'Order placed successfully',
-            order: newOrder
+            order: newOrder,
+            commission: commission
         });
     } catch (error) {
         console.error('Create order error:', error);
@@ -903,8 +910,34 @@ app.post('/notify', (req, res) => {
     res.send('OK');
 });
 
+
+// CinetPay webhook
+app.post('/notify', (req, res) => {
+    console.log('🔔 CinetPay notification:', req.body);
+    res.send('OK');
+});
+
+
+
+
 // ==================== START SERVER ====================
 
+app.put('/api/orders/:id/pay-vendor', authenticateToken, (req, res) => {
+  const orderId = parseInt(req.params.id);
+
+  const orders = readJSONFile(ORDERS_FILE);
+  const orderIndex = orders.findIndex(o => o.id === orderId);
+
+  if (orderIndex === -1) {
+    return res.status(404).json({ message: 'Commande non trouvée' });
+  }
+
+  orders[orderIndex].statutVendeur = 'paye_vendeur';
+  writeJSONFile(ORDERS_FILE, orders);
+
+  res.json({ message: 'Vendeur payé', order: orders[orderIndex] });
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
 });
