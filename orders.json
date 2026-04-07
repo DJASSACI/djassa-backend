@@ -1,1 +1,97 @@
-[]
+[
+  {
+    "id": 1775591726885,
+    "utilisateurId": 1774811941531,
+    "articles": [
+      {
+        "id": 1775130857580,
+        "name": "fior",
+        "price": 1000,
+        "quantite": 1
+      }
+    ],
+    "total": 1050,
+    "date": "2026-04-07T19:55:26.885Z",
+    "statut": "Payée",
+    "statutVendeur": "a_payer_vendeur",
+    "methodePaiement": "wave",
+    "numeroPaiement": "0777380334",
+    "nomCompte": "ganamer"
+  },
+  {
+    "id": 1775592804195,
+    "utilisateurId": 1774811941531,
+    "articles": [
+      {
+        "id": 1775130177629,
+        "name": "le too",
+        "price": 100,
+        "quantite": 1
+      }
+    ],
+    "total": 105,
+    "date": "2026-04-07T20:13:24.195Z",
+    "statut": "Payée",
+    "statutVendeur": "a_payer_vendeur",
+    "methodePaiement": "wave",
+    "numeroPaiement": "0715926401",
+    "nomCompte": "ganame"
+  },
+  {
+    "id": 1775593599845,
+    "utilisateurId": 1774811941531,
+    "articles": [
+      {
+        "id": 1775130857580,
+        "name": "fior",
+        "price": 1000,
+        "quantite": 1
+      }
+    ],
+    "total": 1050,
+    "date": "2026-04-07T20:26:39.845Z",
+    "statut": "Payée",
+    "statutVendeur": "a_payer_vendeur",
+    "methodePaiement": "espèce",
+    "numeroPaiement": "0715926401",
+    "nomCompte": "mawa"
+  },
+  {
+    "id": 1775594641292,
+    "utilisateurId": 1774811941531,
+    "articles": [
+      {
+        "id": 1775130857580,
+        "name": "fior",
+        "price": 1000,
+        "quantite": 1
+      }
+    ],
+    "total": 1050,
+    "date": "2026-04-07T20:44:01.292Z",
+    "statut": "Payée",
+    "statutVendeur": "a_payer_vendeur",
+    "methodePaiement": "wave",
+    "numeroPaiement": "0715926401",
+    "nomCompte": "mawa"
+  },
+  {
+    "id": 1775598828661,
+    "utilisateurId": 1774811941531,
+    "articles": [
+      {
+        "id": 1775598649578,
+        "name": "marto",
+        "price": 12000,
+        "quantite": 1
+      }
+    ],
+    "total": 12600,
+    "date": "2026-04-07T21:53:48.661Z",
+    "statut": "Payée",
+    "statutVendeur": "a_payer_vendeur",
+    "methodePaiement": "wave",
+    "numeroPaiement": "0715926401",
+    "nomCompte": "mawa"
+  }
+]

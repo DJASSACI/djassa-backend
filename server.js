@@ -545,10 +545,10 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
 });
 
 
-// Create order
+// Create order - Backend source of truth: lookup products, set seller
 app.post('/api/orders', authenticateToken, (req, res) => {
     try {
-        const { items, paymentMethod, phoneNumber, accountName } = req.body;
+        const { items, paymentMethod, phoneNumber, accountName, nomLivraison, telLivraison, villeCommune, quartier } = req.body;
 
         if (!items || items.length === 0) {
             return res.status(400).json({ error: 'Cart is empty' });
@@ -558,11 +558,30 @@ app.post('/api/orders', authenticateToken, (req, res) => {
             return res.status(400).json({ error: 'Payment information is required' });
         }
 
-        const subtotal = items.reduce((sum, item) => sum + (item.price * item.quantite), 0);
+        const products = readJSONFile(PRODUCTS_FILE);
+        
+        // Validate/lookup each item, extract seller from products (source of truth)
+        const validatedItems = items.map(item => {
+            const product = products.find(p => p.id === item.id);
+            if (!product || !product.isActive) {
+                throw new Error(`Product ID ${item.id} not found or inactive`);
+            }
+            return {
+                ...item,
+                seller: product.vendeur,  // Backend authoritative seller ID
+                name: product.name,
+                image: product.image,
+                categorie: product.categorie,
+                vendeurNom: product.vendeurNom,
+                vendeurCompte: product.vendeurCompte
+            };
+        });
 
+        const primarySeller = validatedItems[0].seller;  // Main seller for order
+
+        const subtotal = validatedItems.reduce((sum, item) => sum + (item.price * item.quantite), 0);
         const commissionRate = 0.05;
         const commission = subtotal * commissionRate;
-
         const total = subtotal + commission;
 
         const orders = readJSONFile(ORDERS_FILE);
@@ -570,14 +589,19 @@ app.post('/api/orders', authenticateToken, (req, res) => {
         const newOrder = {
             id: Date.now(),
             utilisateurId: req.user.id,
-            articles: items,
+            seller: primarySeller,  // New: Backend source of truth
+            articles: validatedItems,
             total,
             date: new Date().toISOString(),
             statut: 'Payée',
             statutVendeur: 'a_payer_vendeur',
             methodePaiement: paymentMethod,
             numeroPaiement: phoneNumber,
-            nomCompte: accountName
+            nomCompte: accountName,
+            nomLivraison: nomLivraison || null,
+            telLivraison: telLivraison || null,
+            villeCommune: villeCommune || null,
+            quartier: quartier || null
         };
 
         orders.push(newOrder);
@@ -590,9 +614,10 @@ app.post('/api/orders', authenticateToken, (req, res) => {
         });
     } catch (error) {
         console.error('Create order error:', error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({ error: error.message || 'Server error' });
     }
 });
+
 
 // Get user's orders
 app.get('/api/orders/my', authenticateToken, (req, res) => {
@@ -631,10 +656,7 @@ app.get('/api/orders/:id', authenticateToken, (req, res) => {
 // Get all orders (admin)
 app.get('/api/orders', authenticateToken, (req, res) => {
     try {
-        if (req.user.role !== 'admin') {
-            return res.status(403).json({ error: 'Admin access required' });
-        }
-
+        // Allow all authenticated users (sellers filter frontend)
         const orders = readJSONFile(ORDERS_FILE);
         res.json(orders);
     } catch (error) {
@@ -642,6 +664,29 @@ app.get('/api/orders', authenticateToken, (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
+
+// Get seller orders - Uses new order.seller + legacy fallback
+app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
+    try {
+        const sellerId = req.params.sellerId;
+        console.log("SELLER PARAM:", sellerId);
+        const orders = readJSONFile(ORDERS_FILE);
+        
+        // Filter: new order.seller OR legacy articles.vendeur (backward compat)
+        const sellerOrders = orders.filter(order => 
+            order.seller === parseInt(sellerId) ||
+            order.articles.some(article => 
+                String(article.seller || article.vendeur || '').trim() === String(sellerId).trim()
+            )
+        );
+        
+        res.json(sellerOrders);
+    } catch (error) {
+        console.error('Get seller orders error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 
 // Update order status (admin)
 app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
