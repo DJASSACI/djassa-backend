@@ -8,7 +8,6 @@ const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
-const chatRoutes = require('./routes/chatRoutes');
 
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'djassa_ci_secret_key_2024';
@@ -713,14 +712,20 @@ app.post('/api/orders', authenticateToken, (req, res) => {
   }
 });
 
-// Get user's orders (buyer)
+// Get user's orders
 app.get('/api/orders/my', authenticateToken, (req, res) => {
+  console.log('🔍 /api/orders/my - req.user.id:', req.user.id, 'type:', typeof req.user.id);
   try {
     const orders = readJSONFile(ORDERS_FILE);
-    const currentUserId = parseInt(req.user.id);
+    console.log('📊 /api/orders/my - Total orders:', orders.length, 'User ID:', req.user.id);
 
-    const userOrders = orders.filter(o => parseInt(o.utilisateurId) === currentUserId);
+    const userOrders = orders.filter(o => {
+      const match = o.utilisateurId === req.user.id;
+      if (match) console.log('✅ Filtered order ID:', o.id, 'utilisateurId:', o.utilisateurId);
+      return match;
+    });
 
+    console.log('📊 /api/orders/my - Filtered count:', userOrders.length);
     res.json(userOrders);
   } catch (error) {
     console.error('Get orders error:', error);
@@ -753,64 +758,53 @@ app.get('/api/orders/:id', authenticateToken, (req, res) => {
 // Get all orders (admin)
 app.get('/api/orders', authenticateToken, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
+    // Allow all authenticated users (sellers filter frontend)
     const orders = readJSONFile(ORDERS_FILE);
     res.json(orders);
-
   } catch (error) {
     console.error('Get all orders error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Get seller orders - Filter articles to only those owned by seller
+// Get seller orders - Uses new order.seller + legacy fallback
 app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
-  const sellerId = parseInt(req.params.sellerId);
-  const currentUserId = parseInt(req.user.id);
-
-  // Security: sellers can only view their own orders, admins can view any
-  if (currentUserId !== sellerId && req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Vous ne pouvez voir que vos propres commandes' });
-  }
+  const sellerId = req.params.sellerId;
+  console.log('🔍 /api/orders/seller - sellerId:', sellerId, 'type:', typeof sellerId, 'req.user.id:', req.user.id);
 
   try {
+    const sellerId = req.params.sellerId;
+    console.log("SELLER PARAM:", sellerId);
+
     const orders = readJSONFile(ORDERS_FILE);
     const products = readJSONFile(PRODUCTS_FILE);
 
-    const sellerOrders = orders.map(order => {
-      // Filter articles to only those belonging to this seller
-      const sellerArticles = order.articles.filter(article => {
+    // Filter: new order.seller OR legacy articles.vendeur (backward compat)
+    console.log('📊 /api/orders/seller - Total orders:', orders.length);
+
+    const sellerOrders = orders.filter(order => {
+      const sellerMatch = order.seller === parseInt(sellerId);
+      const articleMatch = order.articles.some(article => {
         // 1. Direct seller field on article (new orders)
-        const articleSeller = parseInt(article.seller || article.vendeur || -1);
-        if (articleSeller === sellerId) {
+        if (String(article.seller || article.vendeur || '').trim() === String(sellerId).trim()) {
           return true;
         }
         // 2. Lookup product in catalog to find owner (legacy orders without article.seller)
         const product = products.find(p => p.id === (article.product?.id || article.id));
-        if (product && parseInt(product.vendeur) === sellerId) {
+        if (product && product.vendeur === parseInt(sellerId)) {
           return true;
         }
         return false;
       });
 
-      if (sellerArticles.length === 0) return null;
+      const match = sellerMatch || articleMatch;
+      if (match) {
+        console.log('✅ Seller filtered order:', order.id, '- seller:', order.seller, 'sellerId:', sellerId);
+      }
+      return match;
+    });
 
-      // Calculate seller subtotal (only their articles)
-      const sellerSubtotal = sellerArticles.reduce((sum, item) => sum + (item.price * (item.quantite || 1)), 0);
-      const commissionRate = 0.05;
-      const sellerCommission = sellerSubtotal * commissionRate;
-      const sellerTotal = sellerSubtotal + sellerCommission;
-
-      return {
-        ...order,
-        articles: sellerArticles,
-        sellerTotal: sellerTotal
-      };
-    }).filter(Boolean);
-
+    console.log('📊 /api/orders/seller - Filtered count:', sellerOrders.length);
     res.json(sellerOrders);
   } catch (error) {
     console.error('Get seller orders error:', error);
@@ -820,8 +814,6 @@ app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
 
 
 
-// Update order status (admin)
-app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
   try {
     if (req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required' });
@@ -844,9 +836,6 @@ app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-
-// ==================== CHAT ROUTES ====================
-app.use('/api/messages', authenticateToken, chatRoutes);
 
 // ==================== USERS ROUTES ====================
 
@@ -1093,7 +1082,7 @@ app.post('/notify', (req, res) => {
   }
 
   if (cpm_trans_status === "ACCEPTED") {
-    orders[orderIndex].statut = 'payée';
+orders[orderIndex].statut = 'payée';
     console.log("✅ Paiement confirmé pour commande:", transaction_id);
   } else {
     orders[orderIndex].statut = "refusée";

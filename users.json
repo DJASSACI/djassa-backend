@@ -5,7 +5,7 @@
     "prenom": "mouss",
     "numero": "0777380334",
     "address": "soubrer",
-    "password": "massa bb",
+    "password": "eccc6277280ce7deb61d8fc4327d805a1b837259177e7e2c58a7c48ab681d1a6",
     "role": "user",
     "dateInscription": "2026-03-29T19:19:01.531Z"
   },
@@ -15,8 +15,28 @@
     "prenom": "maka",
     "numero": "0715926401",
     "address": "soubrer",
-    "password": "mawa bb",
-    "role": "user",
+    "password": "cf4ba865be0592be818c0f80df1ab3fb088cca4cf4ab979f8d37d250bb1f828b",
+    "role": "admin",
     "dateInscription": "2026-03-29T20:19:40.227Z"
+  },
+  {
+    "id": 1777396893282,
+    "nom": "outtarat",
+    "prenom": "adiatta",
+    "numero": "0574893317",
+    "address": "abidjan, abbobo",
+    "password": "eddf245464e7909fdda5ca6e2bfaa2922cfa36960a0a65d50b052efe9cd96921",
+    "role": "user",
+    "dateInscription": "2026-04-28T17:21:33.282Z"
+  },
+  {
+    "id": 1777397730189,
+    "nom": "outtara ",
+    "prenom": "abou",
+    "numero": "0777385174",
+    "address": "bondoukou",
+    "password": "8f5bcc762de7193de4134945d5589e85a0f1a6bdbf6551b0fc21b0b8859b5ac5",
+    "role": "user",
+    "dateInscription": "2026-04-28T17:35:30.189Z"
   }
 ]
