@@ -468,20 +468,11 @@ app.get('/api/products/search/:query', (req, res) => {
 });
 
 // Create product (seller) - Support multipart upload
-app.post('/api/products', authenticateToken, upload.single('image'), (req, res) => {
+app.post('/api/products', authenticateToken, (req, res) => {
   try {
-    let imageUrl = 'https://via.placeholder.com/400x400?text=Product';
-    
-    // Si fichier uploadé
-    if (req.file) {
-      const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-      imageUrl = publicUrl;
-    } else if (req.body.image && req.body.image.startsWith('data:image')) {
-      // Fallback base64 (compatibilité ancienne)
-      imageUrl = req.body.image;
-    }
+    const { name, price, description, categorie, vendeurCompte, vendeurLocalisation, paymentMethod, paymentAccount, image } = req.body;
 
-    const { name, price, description, categorie, vendeurCompte, vendeurLocalisation, paymentMethod, paymentAccount } = req.body;
+    let imageUrl = image || 'https://via.placeholder.com/400x400?text=Product';
 
 
     if (!name || !price || !description || !categorie) {
@@ -501,7 +492,7 @@ app.post('/api/products', authenticateToken, upload.single('image'), (req, res) 
       id: Date.now(),
       name,
       price: parseFloat(price),
-      image: image || 'https://via.placeholder.com/400x400?text=Product',
+      image: imageUrl,
       description,
       categorie,
       vendeur: req.user.id,
