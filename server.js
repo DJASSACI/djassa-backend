@@ -10,10 +10,8 @@ const path = require('path');
 require('dotenv').config();
 const chatRoutes = require('./routes/chatRoutes');
 const admin = require('firebase-admin');
-const serviceAccount = require('./config/serviceAccountKey.json');
-
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
 });
 
 const app = express();
