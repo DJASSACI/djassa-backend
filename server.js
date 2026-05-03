@@ -27,8 +27,8 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Multer pour uploads images
 const multer = require('multer');
-// path déjà importé en haut
-const fs = require('fs');
+// fs et path déjà importés en haut
+
 
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
