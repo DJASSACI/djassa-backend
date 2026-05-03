@@ -9,6 +9,12 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const chatRoutes = require('./routes/chatRoutes');
+const admin = require('firebase-admin');
+const serviceAccount = require('./config/serviceAccountKey.json');
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'djassa_ci_secret_key_2024';
@@ -18,6 +24,40 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Multer pour uploads images
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'product-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Seule les images sont autorisées'));
+    }
+  }
+});
+
+
+// Serve static uploads
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Serve static files (frontend)
 app.get('/', (req, res) => {
@@ -428,10 +468,22 @@ app.get('/api/products/search/:query', (req, res) => {
   }
 });
 
-// Create product (seller)
-app.post('/api/products', authenticateToken, (req, res) => {
+// Create product (seller) - Support multipart upload
+app.post('/api/products', authenticateToken, upload.single('image'), (req, res) => {
   try {
-    const { name, price, image, description, categorie, vendeurCompte, vendeurLocalisation } = req.body;
+    let imageUrl = 'https://via.placeholder.com/400x400?text=Product';
+    
+    // Si fichier uploadé
+    if (req.file) {
+      const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+      imageUrl = publicUrl;
+    } else if (req.body.image && req.body.image.startsWith('data:image')) {
+      // Fallback base64 (compatibilité ancienne)
+      imageUrl = req.body.image;
+    }
+
+    const { name, price, description, categorie, vendeurCompte, vendeurLocalisation, paymentMethod, paymentAccount } = req.body;
+
 
     if (!name || !price || !description || !categorie) {
       return res.status(400).json({ error: 'Name, price, description, and category are required' });
@@ -573,7 +625,7 @@ app.get('/api/sellers/:name/products', (req, res) => {
 // ==================== ORDERS ROUTES ====================
 
 // Seller confirm delivery endpoint
-app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
+app.put('/api/orders/:id/confirm-delivery', authenticateToken, async (req, res) => {
   try {
     const orders = readJSONFile(ORDERS_FILE);
     const orderIndex = orders.findIndex(o => o.id === parseInt(req.params.id));
@@ -608,22 +660,22 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
     const users = readJSONFile(USERS_FILE);
     const buyer = users.find(u => u.id == buyerId);
 
-    if (buyer && buyer.fcmToken) {
-      const adminFormData = new FormData();
-      adminFormData.append('to', buyer.fcmToken);
-      adminFormData.append('notification', JSON.stringify({
-        title: 'Livraison Confirmée!',
-        body: `Votre commande #${order.id} a été livrée avec succès.`,
-      }));
-      adminFormData.append('data', JSON.stringify({
-        type: 'order_confirmed',
-        orderId: order.id
-      }));
+if (buyer && buyer.fcmToken) {
+      await admin.messaging().send({
+        token: buyer.fcmToken,
+        notification: {
+          title: "Livraison Confirmée",
+          body: `Votre commande #${order.id} est livrée`,
+        },
+        data: {
+          type: "order_confirmed",
+          orderId: String(order.id),
+        },
+      });
 
-      // Note: Configure FCM server key in backend for real sends
-      console.log(`FCM sent to buyer ${buyer.numero}: Livraison confirmée pour #${order.id}`);
+      console.log("Notification envoyée ✔");
     } else {
-      console.log('No FCM token for buyer, skipping notification');
+      console.log("No FCM token for buyer, skipping notification");
     }
 
     res.json({
