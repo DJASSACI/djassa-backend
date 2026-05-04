@@ -472,8 +472,7 @@ app.post('/api/products', authenticateToken, (req, res) => {
   try {
     const { name, price, description, categorie, vendeurCompte, vendeurLocalisation, paymentMethod, paymentAccount, image } = req.body;
 
-    let imageUrl = image || 'https://via.placeholder.com/400x400?text=Product';
-
+    const imageUrl = image || 'https://via.placeholder.com/400x400?text=Product';
 
     if (!name || !price || !description || !categorie) {
       return res.status(400).json({ error: 'Name, price, description, and category are required' });
