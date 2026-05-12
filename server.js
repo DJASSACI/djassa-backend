@@ -1126,14 +1126,17 @@ app.get('/api/health', (req, res) => {
 
 // GeniusPay webhook
 app.post('/api/payment/geniuspay/webhook', (req, res) => {
-  console.log("🔔 GeniusPay webhook:", req.body);
+  console.log("🔔 Webhook reçu:", req.body);
 
-  const { transaction_id, status } = req.body;
+  const { order_id, status } = req.body;
 
   const orders = readJSONFile(ORDERS_FILE);
-  const orderIndex = orders.findIndex(o => o.id == transaction_id);
+  const orderIndex = orders.findIndex(o => o.id == order_id);
 
-  if (orderIndex === -1) return res.sendStatus(200);
+  if (orderIndex === -1) {
+    console.log("❌ Commande introuvable:", order_id);
+    return res.sendStatus(200);
+  }
 
   if (status === "SUCCESS") {
     orders[orderIndex].statut = "payée";
@@ -1143,8 +1146,10 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
 
   writeJSONFile(ORDERS_FILE, orders);
 
+  console.log("✔️ Commande mise à jour");
   res.sendStatus(200);
 });
+
 
 
 
