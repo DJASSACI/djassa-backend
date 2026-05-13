@@ -7,7 +7,10 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
+const http = require("http");
+const socketIo = require("socket.io");
 require('dotenv').config();
+
 
 const GENIUSPAY_BASE_URL = "https://pay.genius.ci/api/v1/merchant";
 const GENIUSPAY_API_KEY = process.env.GENIUS_API_KEY;
@@ -20,7 +23,26 @@ admin.initializeApp({
 });
 
 const app = express();
+
+const server = http.createServer(app);
+
+const io = socketIo(server, {
+  cors: {
+    origin: "*"
+  }
+});
+
+io.on("connection", (socket) => {
+  console.log("🟢 Client connecté Socket.IO :", socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("🔴 Client déconnecté :", socket.id);
+  });
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || 'djassa_ci_secret_key_2024';
+
+
 const PORT = process.env.PORT || 3000;
 
 // Middleware
@@ -1124,29 +1146,50 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// GeniusPay webhook
 app.post('/api/payment/geniuspay/webhook', (req, res) => {
-  console.log("🔔 Webhook reçu:", req.body);
+  const signature = req.headers['x-webhook-signature'];
+  const timestamp = req.headers['x-webhook-timestamp'];
 
-  const { order_id, status } = req.body;
+  const payload = JSON.stringify(req.body);
+  const secret = process.env.GENIUS_WEBHOOK_SECRET;
+
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(timestamp + '.' + payload)
+    .digest('hex');
+
+  if (signature !== expected) {
+    return res.sendStatus(401);
+  }
+
+  const event = req.body.event;
+  const orderId = req.body.data?.metadata?.order_id;
 
   const orders = readJSONFile(ORDERS_FILE);
-  const orderIndex = orders.findIndex(o => o.id == order_id);
+  const index = orders.findIndex(o => o.id == orderId);
 
-  if (orderIndex === -1) {
-    console.log("❌ Commande introuvable:", order_id);
-    return res.sendStatus(200);
+  if (index !== -1) {
+    if (event === "payment.success") {
+      orders[index].statut = "payée";
+
+      io.emit("payment_update", {
+        orderId,
+        status: "payée"
+      });
+    }
+
+    if (event === "payment.failed") {
+      orders[index].statut = "échouée";
+
+      io.emit("payment_update", {
+        orderId,
+        status: "échouée"
+      });
+    }
+
+    writeJSONFile(ORDERS_FILE, orders);
   }
 
-  if (status === "SUCCESS") {
-    orders[orderIndex].statut = "payée";
-  } else {
-    orders[orderIndex].statut = "échouée";
-  }
-
-  writeJSONFile(ORDERS_FILE, orders);
-
-  console.log("✔️ Commande mise à jour");
   res.sendStatus(200);
 });
 
@@ -1210,35 +1253,54 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
 
 app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
   try {
-    const { amount, phone, orderId } = req.body;
+    const { amount, phone, orderId, name,  } = req.body;
 
-    const response = await fetch(`${GENIUSPAY_BASE_URL}/payment/init`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${GENIUSPAY_API_KEY}`
-      },
-      body: JSON.stringify({
-        amount,
-        phone,
-        order_id: orderId,
-        callback_url: "https://djassa-backend-imxo.onrender.com/api/payment/geniuspay/webhook"
-      })
-    });
+    const response = await fetch(
+      "https://pay.genius.ci/api/v1/merchant/payments",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": process.env.GENIUS_API_KEY,
+          "X-API-Secret": process.env.GENIUS_API_SECRET,
+        },
+        body: JSON.stringify({
+          amount: amount,
+          description: `Commande ${orderId}`,
+          customer: {
+            name: name,
+            phone: phone,
+          },
+          metadata: {
+            order_id: orderId,
+          }
+        }),
+      }
+    );
 
     const data = await response.json();
 
-    res.json({
+    if (!data.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment creation failed",
+        error: data,
+      });
+    }
+
+    return res.json({
       success: true,
-      data
+      checkout_url: data.data.checkout_url,
+      reference: data.data.reference,
     });
 
   } catch (error) {
+    console.error("GeniusPay error:", error);
     res.status(500).json({ error: "Payment init failed" });
   }
 });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
 });
 
