@@ -12,9 +12,9 @@ const socketIo = require("socket.io");
 require('dotenv').config();
 
 
-const GENIUSPAY_BASE_URL = "https://pay.genius.ci/api/v1/merchant";
-const GENIUSPAY_API_KEY = process.env.GENIUS_API_KEY;
-const GENIUSPAY_API_SECRET = process.env.GENIUS_API_SECRET;
+
+const GENIUSPAY_API_KEY = process.env.GENIUSPAY_API_KEY;
+const GENIUSPAY_API_SECRET = process.env.GENIUSPAY_SECRET_KEY;
 const fetch = require('node-fetch');
 const chatRoutes = require('./routes/chatRoutes');
 const admin = require('firebase-admin');
