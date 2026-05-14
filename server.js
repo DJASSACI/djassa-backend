@@ -1253,7 +1253,21 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
 
 app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
   try {
-    const { amount, phone, orderId, name,  } = req.body;
+    const { amount, phone, orderId, name } = req.body;
+
+    const payload = {
+      amount: Number(amount),
+      description: `Commande ${orderId}`,
+      customer: {
+        name: name,
+        phone: phone.startsWith("+") ? phone : `+225${phone}`
+      },
+      metadata: {
+        order_id: String(orderId)
+      }
+    };
+
+    console.log("👉 GeniusPay payload:", payload);
 
     const response = await fetch(
       "https://pay.genius.ci/api/v1/merchant/payments",
@@ -1261,30 +1275,21 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": process.env.GENIUS_API_KEY,
-          "X-API-Secret": process.env.GENIUS_API_SECRET,
+          "X-API-Key": GENIUSPAY_API_KEY,
+          "X-API-Secret": GENIUSPAY_API_SECRET,
         },
-        body: JSON.stringify({
-          amount: amount,
-          description: `Commande ${orderId}`,
-          customer: {
-            name: name,
-            phone: phone,
-          },
-          metadata: {
-            order_id: orderId,
-          }
-        }),
+        body: JSON.stringify(payload),
       }
     );
 
     const data = await response.json();
 
-    if (!data.success) {
+    console.log("👉 GeniusPay response:", data);
+
+    if (!response.ok || !data.success) {
       return res.status(400).json({
         success: false,
-        message: "Payment creation failed",
-        error: data,
+        error: data
       });
     }
 
