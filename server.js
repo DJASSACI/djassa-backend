@@ -942,9 +942,11 @@ app.put('/api/users/profile', authenticateToken, (req, res) => {
     const users = readJSONFile(USERS_FILE);
     const userIndex = users.findIndex(u => u.id === req.user.id);
 
+
     if (userIndex === -1) {
       return res.status(404).json({ error: 'User not found' });
     }
+
 
     const { nom, prenom, address } = req.body;
 
@@ -968,12 +970,37 @@ app.put('/api/users/profile', authenticateToken, (req, res) => {
   }
 });
 
+app.put('/api/users/fcm-token', authenticateToken, (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+
+    const users = readJSONFile(USERS_FILE);
+    const index = users.findIndex(u => u.id === req.user.id);
+
+    if (index === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    users[index].fcmToken = fcmToken;
+    console.log("🔥 FCM TOKEN ENREGISTRÉ =", users[index].fcmToken);
+    writeJSONFile(USERS_FILE, users);
+
+
+    res.json({ message: 'FCM token saved' });
+  } catch (error) {
+    console.error('FCM token save error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Get all users (admin)
 app.get('/api/users', authenticateToken, (req, res) => {
   try {
     if (req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required' });
     }
+
+
 
     const users = readJSONFile(USERS_FILE);
     const usersWithoutPassword = users.map(({ password, ...user }) => user);
