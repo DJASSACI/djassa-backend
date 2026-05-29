@@ -1286,7 +1286,7 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       amount: Number(amount),
       description: `Commande ${orderId}`,
       customer: {
-        name: name,
+        name,
         phone: phone.startsWith("+") ? phone : `+225${phone}`
       },
       metadata: {
@@ -1294,24 +1294,32 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       }
     };
 
-    console.log("👉 GeniusPay payload:", payload);
+    console.log("🔥 PAYLOAD GENIUSPAY =", JSON.stringify(payload, null, 2));
 
-    const response = await fetch(
-      "https://geniuspay.ci/api/v1/merchant/payments",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-API-Key": GENIUSPAY_API_KEY,
-          "X-API-Secret": GENIUSPAY_API_SECRET,
-        },
-        body: JSON.stringify(payload),
-      }
-    );
+    const response = await fetch("https://geniuspay.ci/api/v1/merchant/payments", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": GENIUSPAY_API_KEY,
+        "X-API-Secret": GENIUSPAY_API_SECRET,
+      },
+      body: JSON.stringify(payload),
+    });
 
-    const data = await response.json();
+    const text = await response.text();
 
-    console.log("👉 GeniusPay response:", data);
+    console.log("🔥 STATUS =", response.status);
+    console.log("🔥 RAW RESPONSE =", text);
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      return res.status(500).json({
+        error: "GeniusPay returned non-JSON response",
+        raw: text
+      });
+    }
 
     if (!response.ok || !data.success) {
       return res.status(400).json({
@@ -1327,7 +1335,7 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error("GeniusPay error:", error);
+    console.error("🔥 GENIUSPAY ERROR =", error);
     res.status(500).json({ error: "Payment init failed" });
   }
 });
