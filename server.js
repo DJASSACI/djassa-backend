@@ -1297,7 +1297,7 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
     console.log("👉 GeniusPay payload:", payload);
 
     const response = await fetch(
-      "https://pay.genius.ci/api/v1/merchant/payments",
+      "https://geniuspay.ci/api/v1/merchant/payments",
       {
         method: "POST",
         headers: {
