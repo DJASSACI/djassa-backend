@@ -1316,16 +1316,17 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       });
     }
 
-    const response = await fetch("https://pay.genius.ci/api/v1/merchant/payments", {
+    const response = await fetch("https://api.genius.ci/api/v1/merchant/payments", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-API-Key": GENIUSPAY_API_KEY,
-        "X-API-Secret": GENIUSPAY_API_SECRET,
+        "Authorization": `Bearer ${GENIUSPAY_API_SECRET}`,
+        "X-API-KEY": GENIUSPAY_API_KEY,
+        "User-Agent": "DjassaCI/1.0"
       },
-
       body: JSON.stringify(payload),
     });
+
 
     const text = await response.text();
 
