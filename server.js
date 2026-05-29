@@ -15,7 +15,7 @@ require('dotenv').config();
 
 const GENIUSPAY_API_KEY = process.env.GENIUSPAY_API_KEY;
 const GENIUSPAY_API_SECRET = process.env.GENIUSPAY_SECRET_KEY;
-const fetch = require('node-fetch');
+const fetch = global.fetch;
 const chatRoutes = require('./routes/chatRoutes');
 const admin = require('firebase-admin');
 admin.initializeApp({
@@ -1177,7 +1177,8 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   const signature = req.headers['x-webhook-signature'];
   const timestamp = req.headers['x-webhook-timestamp'];
 
-  const payload = JSON.stringify(req.body);
+  const payload = JSON.stringify(req.body, Object.keys(req.body).sort());
+
   const secret = process.env.GENIUS_WEBHOOK_SECRET;
 
   const expected = crypto
@@ -1286,12 +1287,11 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Phone is required" });
     }
 
-    const amountParsed = parseFloat(amount);
-
-
-    if (!amount || isNaN(amountParsed)) {
+    const amountParsed = Number(amount);
+    if (!Number.isFinite(amountParsed)) {
       return res.status(400).json({ error: "Invalid amount" });
     }
+
 
     const payload = {
       amount: amountParsed,
@@ -1321,7 +1321,7 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       headers: {
         "Content-Type": "application/json",
         "X-API-Key": GENIUSPAY_API_KEY,
-        "X-API-Secret": GENIUSPAY_SECRET_KEY,
+        "X-API-Secret": GENIUSPAY_API_SECRET,
       },
 
       body: JSON.stringify(payload),
