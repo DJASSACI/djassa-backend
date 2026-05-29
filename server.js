@@ -1282,9 +1282,23 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
   try {
     const { amount, phone, orderId, name } = req.body;
 
+    if (!phone) {
+      return res.status(400).json({ error: "Phone is required" });
+    }
+
+    const amountParsed = parseFloat(amount);
+
+
+    if (!amount || isNaN(amountParsed)) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+
     const payload = {
-      amount: Number(amount),
+      amount: amountParsed,
+
       description: `Commande ${orderId}`,
+
+
       customer: {
         name,
         phone: phone.startsWith("+") ? phone : `+225${phone}`
@@ -1296,13 +1310,20 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
 
     console.log("🔥 PAYLOAD GENIUSPAY =", JSON.stringify(payload, null, 2));
 
-    const response = await fetch("https://geniuspay.ci/api/v1/merchant/payments", {
+    if (!GENIUSPAY_API_KEY || !GENIUSPAY_API_SECRET) {
+      return res.status(500).json({
+        error: "Missing GeniusPay API keys in environment variables"
+      });
+    }
+
+    const response = await fetch("https://pay.genius.ci/api/v1/merchant/payments", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-API-Key": GENIUSPAY_API_KEY,
-        "X-API-Secret": GENIUSPAY_API_SECRET,
+        "X-API-Secret": GENIUSPAY_SECRET_KEY,
       },
+
       body: JSON.stringify(payload),
     });
 
@@ -1321,17 +1342,28 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       });
     }
 
-    if (!response.ok || !data.success) {
+    const checkoutUrl =
+      data?.data?.checkout_url ||
+      data?.checkout_url;
+
+    const reference =
+      data?.data?.reference ||
+      data?.reference;
+
+    if (!response.ok || !checkoutUrl) {
+      console.log("❌ GENIUSPAY ERROR:", data);
+
       return res.status(400).json({
         success: false,
-        error: data
+        error: data,
+        message: "Paiement refusé ou checkout_url manquant"
       });
     }
 
     return res.json({
       success: true,
-      checkout_url: data.data.checkout_url,
-      reference: data.data.reference,
+      checkout_url: checkoutUrl,
+      reference: reference,
     });
 
   } catch (error) {
