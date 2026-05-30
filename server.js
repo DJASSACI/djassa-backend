@@ -1177,7 +1177,8 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   const signature = req.headers['x-webhook-signature'];
   const timestamp = req.headers['x-webhook-timestamp'];
 
-  const payload = JSON.stringify(req.body, Object.keys(req.body).sort());
+  const payload = JSON.stringify(req.body);
+
 
   const secret = process.env.GENIUS_WEBHOOK_SECRET;
 
@@ -1316,16 +1317,16 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       });
     }
 
-    const response = await fetch("https://api.genius.ci/api/v1/merchant/payments", {
+    const response = await fetch("https://geniuspay.ci/api/v1/merchant/payments", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${GENIUSPAY_API_SECRET}`,
         "X-API-KEY": GENIUSPAY_API_KEY,
-        "User-Agent": "DjassaCI/1.0"
+        "X-API-SECRET": GENIUSPAY_API_SECRET,
       },
       body: JSON.stringify(payload),
     });
+
 
 
     const text = await response.text();
