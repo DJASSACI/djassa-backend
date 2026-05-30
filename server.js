@@ -14,8 +14,10 @@ require('dotenv').config();
 
 
 const GENIUSPAY_API_KEY = process.env.GENIUSPAY_API_KEY;
-const GENIUSPAY_API_SECRET = process.env.GENIUSPAY_SECRET_KEY;
+const GENIUSPAY_SECRET_KEY = process.env.GENIUSPAY_SECRET_KEY;
+const GENIUSPAY_BASE_URL = process.env.GENIUSPAY_BASE_URL;
 const fetch = global.fetch;
+const activePayments = new Map();
 const chatRoutes = require('./routes/chatRoutes');
 const admin = require('firebase-admin');
 admin.initializeApp({
@@ -1284,22 +1286,26 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
   try {
     const { amount, phone, orderId, name } = req.body;
 
+    if (activePayments.has(orderId)) {
+      return res.status(429).json({ error: "Paiement déjà en cours" });
+    }
+
+    activePayments.set(orderId, true);
+
     if (!phone) {
+      activePayments.delete(orderId);
       return res.status(400).json({ error: "Phone is required" });
     }
 
     const amountParsed = Number(amount);
     if (!Number.isFinite(amountParsed)) {
+      activePayments.delete(orderId);
       return res.status(400).json({ error: "Invalid amount" });
     }
 
-
     const payload = {
       amount: amountParsed,
-
       description: `Commande ${orderId}`,
-
-
       customer: {
         name,
         phone: phone.startsWith("+") ? phone : `+225${phone}`
@@ -1311,12 +1317,6 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
 
     console.log("🔥 PAYLOAD GENIUSPAY =", JSON.stringify(payload, null, 2));
 
-    if (!GENIUSPAY_API_KEY || !GENIUSPAY_API_SECRET) {
-      return res.status(500).json({
-        error: "Missing GeniusPay API keys in environment variables"
-      });
-    }
-
     const response = await fetch("https://geniuspay.ci/api/v1/merchant/payments", {
       method: "POST",
       headers: {
@@ -1327,12 +1327,7 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
       body: JSON.stringify(payload),
     });
 
-
-
     const text = await response.text();
-
-    console.log("🔥 STATUS =", response.status);
-    console.log("🔥 RAW RESPONSE =", text);
 
     let data;
     try {
@@ -1345,16 +1340,12 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
     }
 
     const checkoutUrl =
-      data?.data?.checkout_url ||
-      data?.checkout_url;
+      data?.data?.checkout_url || data?.checkout_url;
 
     const reference =
-      data?.data?.reference ||
-      data?.reference;
+      data?.data?.reference || data?.reference;
 
     if (!response.ok || !checkoutUrl) {
-      console.log("❌ GENIUSPAY ERROR:", data);
-
       return res.status(400).json({
         success: false,
         error: data,
@@ -1365,14 +1356,19 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
     return res.json({
       success: true,
       checkout_url: checkoutUrl,
-      reference: reference,
+      reference
     });
 
   } catch (error) {
     console.error("🔥 GENIUSPAY ERROR =", error);
     res.status(500).json({ error: "Payment init failed" });
+
+  } finally {
+    const { orderId } = req.body;
+    if (orderId) activePayments.delete(orderId);
   }
 });
+
 
 server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
