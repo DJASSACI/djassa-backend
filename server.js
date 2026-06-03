@@ -870,6 +870,96 @@ app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
 app.use('/api/messages', authenticateToken, chatRoutes);
 
 // USERS
+
+// Certification seller (monthly subscription 1000 FCFA, one-shot)
+// NOTE: Paiement GeniusPay n'est pas automatiquement intégré côté certificat.
+// On simule l'activation mensuelle: sellerVerifiedUntil = now + 30 jours.
+// Si la date est expirée, sellerVerified sera automatiquement remise à false lors du prochain check.
+
+const MONTHLY_SUBSCRIPTION_FCFA = 1000;
+
+function isSellerSubscriptionActive(user) {
+  const until = user?.sellerVerifiedUntil;
+  if (!until) return false;
+  const untilDate = new Date(until);
+  if (Number.isNaN(untilDate.getTime())) return false;
+  return untilDate.getTime() > Date.now();
+}
+
+function refreshSellerVerifiedStatus(user) {
+  const active = isSellerSubscriptionActive(user);
+  user.sellerVerified = active;
+  if (active && !user.sellerVerifiedAt) {
+    user.sellerVerifiedAt = new Date().toISOString();
+  }
+  if (!active) {
+    user.sellerVerifiedAt = user.sellerVerifiedAt ?? null;
+  }
+}
+
+// Met à jour un champ `sellerVerified` + `sellerVerifiedUntil` dans users.json.
+app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
+  try {
+    const { sellerCompte, sellerLocalisation } = req.body || {};
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const now = new Date();
+    const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    // Activation mensuelle (démo) : 1000 FCFA / mois
+    users[userIndex] = {
+      ...users[userIndex],
+      sellerVerified: true,
+      sellerVerifiedAt: users[userIndex].sellerVerifiedAt ?? now.toISOString(),
+      sellerVerifiedUntil: until.toISOString(),
+      // champs optionnels (pour garder trace du compte saisi)
+      sellerCompte: sellerCompte ?? users[userIndex].sellerCompte ?? '',
+      sellerLocalisation:
+        sellerLocalisation ??
+        users[userIndex].sellerLocalisation ??
+        users[userIndex].address ??
+        '',
+      // trace info abonnement
+      sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Seller verified successfully (30 days)', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Verify seller error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Endpoint: vérifier et mettre à jour sellerVerified selon sellerVerifiedUntil.
+app.post('/api/users/refresh-seller-verified', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = users[userIndex];
+    refreshSellerVerifiedStatus(user);
+
+    users[userIndex] = user;
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Seller verification refreshed', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Refresh seller verified error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/users/profile', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
@@ -948,8 +1038,47 @@ app.get('/api/users', authenticateToken, (req, res) => {
   }
 });
 
+app.post('/api/users/certify-seller/init', authenticateToken, async (req, res) => {
+  try {
+    const payload = {
+      amount: 1000,
+      description: 'Certification vendeur Djassa CI',
+      customer: {
+        name: req.body.name,
+        phone: req.body.phone || req.user.numero,
+
+      },
+      metadata: {
+        payment_type: 'seller_certification',
+        user_id: String(req.user.id),
+      },
+    };
+
+    const response = await fetch('https://geniuspay.ci/api/v1/merchant/payments', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': GENIUSPAY_API_KEY,
+        'X-API-Secret': GENIUSPAY_SECRET_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+
+    return res.json({
+      success: true,
+      checkout_url: data.data.checkout_url,
+      reference: data.data.reference,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Certification init failed' });
+  }
+});
+
 // ARTICLES
 app.get('/api/articles', (req, res) => {
+
   try {
     const articles = readJSONFile(ARTICLES_FILE);
     res.json(articles);
@@ -1098,8 +1227,11 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   }
 
   const event = req.body.event;
-  const orderId = req.body.data?.metadata?.order_id;
+  const metadata = req.body.data?.metadata || {};
+  const orderId = metadata.order_id;
+  const paymentType = metadata.payment_type; // 'order' | 'seller_certification'
 
+  // 1) Paiements des commandes (flux existant)
   const orders = readJSONFile(ORDERS_FILE);
   const index = orders.findIndex((o) => o.id == orderId);
 
@@ -1115,6 +1247,29 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
     }
 
     writeJSONFile(ORDERS_FILE, orders);
+  }
+
+  // 2) Paiement certification vendeur
+  if (paymentType === 'seller_certification' && event === 'payment.success') {
+    const certificationUserId = metadata.user_id;
+    if (certificationUserId) {
+      const users = readJSONFile(USERS_FILE);
+      const userIndex = users.findIndex((u) => u.id == certificationUserId);
+      if (userIndex !== -1) {
+        const now = new Date();
+        const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+        users[userIndex] = {
+          ...users[userIndex],
+          sellerVerified: true,
+          sellerVerifiedAt: now.toISOString(),
+          sellerVerifiedUntil: until.toISOString(),
+          sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+        };
+
+        writeJSONFile(USERS_FILE, users);
+      }
+    }
   }
 
   res.sendStatus(200);
@@ -1221,4 +1376,3 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
 });
-
