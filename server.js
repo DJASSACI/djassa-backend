@@ -898,6 +898,50 @@ function refreshSellerVerifiedStatus(user) {
 }
 
 // Met à jour un champ `sellerVerified` + `sellerVerifiedUntil` dans users.json.
+// Admin: certifier un user par userId
+app.put('/api/admin/users/:userId/verify-seller', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const certificationUserId = parseInt(req.params.userId);
+    const { sellerCompte, sellerLocalisation } = req.body || {};
+
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === certificationUserId);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const now = new Date();
+    const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    users[userIndex] = {
+      ...users[userIndex],
+      sellerVerified: true,
+      sellerVerifiedAt: users[userIndex].sellerVerifiedAt ?? now.toISOString(),
+      sellerVerifiedUntil: until.toISOString(),
+      sellerCompte: sellerCompte ?? users[userIndex].sellerCompte ?? '',
+      sellerLocalisation:
+        sellerLocalisation ??
+        users[userIndex].sellerLocalisation ??
+        users[userIndex].address ??
+        '',
+      sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'User verified by admin (30 days)', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Admin verify seller error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Certification seller (monthly subscription 1000 FCFA, one-shot)
 app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
   try {
     const { sellerCompte, sellerLocalisation } = req.body || {};
@@ -1376,3 +1420,4 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
 });
+
