@@ -404,7 +404,29 @@ app.get('/api/products', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
     const activeProducts = products.filter((p) => p.isActive !== false);
-    res.json(activeProducts);
+
+    const users = readJSONFile(USERS_FILE);
+    const enhanced = activeProducts.map((p) => {
+      const vendeurId = p.vendeur;
+      const vendeurUser = users.find((u) => u.id == vendeurId);
+
+      return {
+        ...p,
+        // côté Flutter on attend `product.vendeur` comme un objet
+        vendeur: {
+          ...(typeof p.vendeur === 'object' && p.vendeur != null ? p.vendeur : {}),
+          id: vendeurUser?.id,
+          nom: vendeurUser?.nom,
+          prenom: vendeurUser?.prenom,
+          numero: vendeurUser?.numero,
+          address: vendeurUser?.address,
+          sellerVerified: vendeurUser?.sellerVerified === true,
+          sellerVerifiedAt: vendeurUser?.sellerVerifiedAt ?? null,
+        },
+      };
+    });
+
+    res.json(enhanced);
   } catch (error) {
     console.error('Get products error:', error);
     res.status(500).json({ error: 'Server error' });
@@ -898,24 +920,31 @@ function refreshSellerVerifiedStatus(user) {
 }
 
 // Met à jour un champ `sellerVerified` + `sellerVerifiedUntil` dans users.json.
-// Admin: certifier un user par userId
-app.put('/api/admin/users/:userId/verify-seller', authenticateToken, (req, res) => {
+// Alias admin (pour que le dashboard admin puisse certifier sans changer le Flutter)
+app.put('/api/admin/users/:id/verify-seller', authenticateToken, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
-    const certificationUserId = parseInt(req.params.userId);
     const { sellerCompte, sellerLocalisation } = req.body || {};
 
     const users = readJSONFile(USERS_FILE);
-    const userIndex = users.findIndex((u) => u.id === certificationUserId);
+    const userIndex = users.findIndex((u) => String(u.id) === String(req.params.id));
     if (userIndex === -1) {
       return res.status(404).json({ error: 'User not found' });
     }
 
     const now = new Date();
-    const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    const currentUntil = users[userIndex]?.sellerVerifiedUntil;
+    const currentUntilDate = currentUntil ? new Date(currentUntil) : null;
+
+    let baseDate = now;
+    if (currentUntilDate && !Number.isNaN(currentUntilDate.getTime())) {
+      // Si l'abonnement n'est pas expiré, on étend depuis sellerVerifiedUntil
+      if (currentUntilDate.getTime() > now.getTime()) {
+        baseDate = currentUntilDate;
+      }
+    }
+
+    const until = new Date(baseDate.getTime() + 30 * 24 * 60 * 60 * 1000);
 
     users[userIndex] = {
       ...users[userIndex],
@@ -934,17 +963,17 @@ app.put('/api/admin/users/:userId/verify-seller', authenticateToken, (req, res) 
     writeJSONFile(USERS_FILE, users);
 
     const { password: _, ...userWithoutPassword } = users[userIndex];
-    res.json({ message: 'User verified by admin (30 days)', user: userWithoutPassword });
+    res.json({ message: 'Seller verified successfully (30 days)', user: userWithoutPassword });
   } catch (error) {
-    console.error('Admin verify seller error:', error);
+    console.error('Verify seller (admin alias) error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Certification seller (monthly subscription 1000 FCFA, one-shot)
 app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
   try {
     const { sellerCompte, sellerLocalisation } = req.body || {};
+
     const users = readJSONFile(USERS_FILE);
     const userIndex = users.findIndex((u) => u.id === req.user.id);
     if (userIndex === -1) {
@@ -952,13 +981,28 @@ app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
     }
 
     const now = new Date();
-    const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    // Activation mensuelle (démo) : 1000 FCFA / mois
+    // Renouvellement 30 jours (recharge à chaque certification)
+    // => si l'utilisateur est déjà certifié, on prolonge à partir de la date actuelle d'expiration
+    const currentUntil = users[userIndex]?.sellerVerifiedUntil;
+    const currentUntilDate = currentUntil ? new Date(currentUntil) : null;
+
+    let baseDate = now;
+    if (currentUntilDate && !Number.isNaN(currentUntilDate.getTime())) {
+      // Si l'abonnement n'est pas expiré, on étend depuis sellerVerifiedUntil
+      if (currentUntilDate.getTime() > now.getTime()) {
+        baseDate = currentUntilDate;
+      }
+    }
+
+    const until = new Date(baseDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+
     users[userIndex] = {
       ...users[userIndex],
       sellerVerified: true,
+      // sellerVerifiedAt: on ne remplace pas la date initiale de certification
       sellerVerifiedAt: users[userIndex].sellerVerifiedAt ?? now.toISOString(),
+      // sellerVerifiedUntil: mise à jour à chaque renouvellement
       sellerVerifiedUntil: until.toISOString(),
       // champs optionnels (pour garder trace du compte saisi)
       sellerCompte: sellerCompte ?? users[userIndex].sellerCompte ?? '',
@@ -1416,6 +1460,46 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Payment init failed' });
   }
 });
+
+// ---- Seller certification auto-expiration job (runs periodically) ----
+// Important: this is a lightweight JSON-file update to ensure sellerVerified
+// is automatically set to false after sellerVerifiedUntil expires.
+// Runs every 10 minutes.
+const SELLER_VERIFICATION_CRON_MS = 10 * 60 * 1000;
+
+function autoExpireSellerVerifications() {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    if (!Array.isArray(users) || users.length === 0) return;
+
+    let changed = false;
+    const nowMs = Date.now();
+
+    users.forEach((u, idx) => {
+      if (!u || !u.sellerVerifiedUntil) return;
+
+      const untilDate = new Date(u.sellerVerifiedUntil);
+      if (Number.isNaN(untilDate.getTime())) return;
+
+      const active = untilDate.getTime() > nowMs;
+      if (u.sellerVerified === true && !active) {
+        users[idx].sellerVerified = false;
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      writeJSONFile(USERS_FILE, users);
+      console.log('⏳ Auto-expired seller verifications (users.json updated)');
+    }
+  } catch (e) {
+    console.error('Auto-expire seller verifications failed:', e);
+  }
+}
+
+// Start immediately and then periodically.
+autoExpireSellerVerifications();
+setInterval(autoExpireSellerVerifications, SELLER_VERIFICATION_CRON_MS);
 
 server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
