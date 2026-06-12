@@ -410,6 +410,12 @@ app.get('/api/products', (req, res) => {
       const vendeurId = p.vendeur;
       const vendeurUser = users.find((u) => u.id == vendeurId);
 
+      // Forcer la valeur persistée `sellerVerified` à être cohérente avec `sellerVerifiedUntil`
+      // (sinon le frontend peut voir temporairement false après verify-seller).
+      if (vendeurUser) {
+        refreshSellerVerifiedStatus(vendeurUser);
+      }
+
       return {
         ...p,
         // côté Flutter on attend `product.vendeur` comme un objet
@@ -422,6 +428,8 @@ app.get('/api/products', (req, res) => {
           address: vendeurUser?.address,
           sellerVerified: vendeurUser?.sellerVerified === true,
           sellerVerifiedAt: vendeurUser?.sellerVerifiedAt ?? null,
+          // Alias pour compatibilité (certains écrans lisent seller_verified)
+          seller_verified: vendeurUser?.sellerVerified === true,
         },
       };
     });
@@ -1504,4 +1512,3 @@ setInterval(autoExpireSellerVerifications, SELLER_VERIFICATION_CRON_MS);
 server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
 });
-
