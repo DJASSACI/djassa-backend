@@ -1194,6 +1194,54 @@ app.delete('/api/users/:userId/follow', authenticateToken, (req, res) => {
   }
 });
 
+app.get('/api/users/:userId/followers', authenticateToken, (req, res) => {
+  try {
+    const targetId = String(req.params.userId);
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const followerIds = subscriptions
+      .filter((s) => String(s.followingId) === targetId)
+      .map((s) => String(s.followerId));
+    const users = readJSONFile(USERS_FILE).filter((u) => followerIds.includes(String(u.id)));
+    res.json(
+      users.map((u) => ({
+        id: u.id,
+        nom: u.nom,
+        prenom: u.prenom,
+        numero: u.numero,
+        address: u.address,
+        sellerVerified: u.sellerVerified,
+      }))
+    );
+  } catch (error) {
+    console.error('Get followers error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/users/:userId/following', authenticateToken, (req, res) => {
+  try {
+    const targetId = String(req.params.userId);
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const followingIds = subscriptions
+      .filter((s) => String(s.followerId) === targetId)
+      .map((s) => String(s.followingId));
+    const users = readJSONFile(USERS_FILE).filter((u) => followingIds.includes(String(u.id)));
+    res.json(
+      users.map((u) => ({
+        id: u.id,
+        nom: u.nom,
+        prenom: u.prenom,
+        numero: u.numero,
+        address: u.address,
+        sellerVerified: u.sellerVerified,
+      }))
+    );
+  } catch (error) {
+    console.error('Get following error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/users/profile', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
