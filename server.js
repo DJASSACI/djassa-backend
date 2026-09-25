@@ -1242,6 +1242,33 @@ app.get('/api/users/:userId/following', authenticateToken, (req, res) => {
   }
 });
 
+app.get('/api/users/:userId', (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const user = users.find((u) => String(u.id) === targetId);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const publicUser = {
+      id: user.id,
+      nom: user.nom,
+      prenom: user.prenom,
+      avatarUrl: user.avatarUrl || null,
+      sellerVerified: user.sellerVerified || false,
+      sellerVerifiedAt: user.sellerVerifiedAt || null,
+      sellerVerifiedUntil: user.sellerVerifiedUntil || null,
+    };
+
+    res.json(publicUser);
+  } catch (error) {
+    console.error('Get public user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/users/profile', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
