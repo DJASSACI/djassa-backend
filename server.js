@@ -16,11 +16,13 @@ const fetch = require('node-fetch');
 const chatRoutes = require('./routes/chatRoutes');
 
 const admin = require('firebase-admin');
-admin.initializeApp({
-  credential: admin.credential.cert(
-    JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-  ),
-});
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  admin.initializeApp({
+    credential: admin.credential.cert(
+      JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+    ),
+  });
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -96,6 +98,7 @@ const USERS_FILE = path.join(JSON_STORAGE_DIR, 'users.json');
 const PRODUCTS_FILE = path.join(JSON_STORAGE_DIR, 'products.json');
 const ORDERS_FILE = path.join(JSON_STORAGE_DIR, 'orders.json');
 const ARTICLES_FILE = path.join(JSON_STORAGE_DIR, 'articles.json');
+const SUBSCRIPTIONS_FILE = path.join(JSON_STORAGE_DIR, 'subscriptions.json');
 
 const ensureJSONFilesDir = () => {
   try {
@@ -254,6 +257,9 @@ const initializeData = () => {
   }
   if (!fs.existsSync(ORDERS_FILE)) {
     writeJSONFile(ORDERS_FILE, []);
+  }
+  if (!fs.existsSync(SUBSCRIPTIONS_FILE)) {
+    writeJSONFile(SUBSCRIPTIONS_FILE, []);
   }
 };
 
@@ -1080,6 +1086,110 @@ app.post('/api/users/refresh-seller-verified', authenticateToken, (req, res) => 
     res.json({ message: 'Seller verification refreshed', user: userWithoutPassword });
   } catch (error) {
     console.error('Refresh seller verified error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/users/:userId/follow', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const targetUser = users.find((user) => String(user.id) === targetId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const isFollowing = subscriptions.some(
+      (subscription) =>
+        String(subscription.followerId) === String(req.user.id) &&
+        String(subscription.followingId) === targetId
+    );
+    const followersCount = subscriptions.filter(
+      (subscription) => String(subscription.followingId) === targetId
+    ).length;
+
+    res.json({ isFollowing, followersCount });
+  } catch (error) {
+    console.error('Get follow status error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/users/:userId/follow', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const followerId = String(req.user.id);
+    if (followerId === targetId) {
+      return res.status(400).json({ error: 'Vous ne pouvez pas vous abonner à vous-même' });
+    }
+
+    const targetUser = users.find((user) => String(user.id) === targetId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const existingSubscription = subscriptions.find(
+      (subscription) =>
+        String(subscription.followerId) === followerId &&
+        String(subscription.followingId) === targetId
+    );
+    if (!existingSubscription) {
+      subscriptions.push({
+        id: Date.now(),
+        followerId: req.user.id,
+        followingId: targetUser.id,
+        createdAt: new Date().toISOString(),
+      });
+      writeJSONFile(SUBSCRIPTIONS_FILE, subscriptions);
+    }
+
+    const followersCount = subscriptions.filter(
+      (subscription) => String(subscription.followingId) === targetId
+    ).length;
+    res.status(existingSubscription ? 200 : 201).json({
+      subscribed: true,
+      isFollowing: true,
+      followersCount,
+    });
+  } catch (error) {
+    console.error('Follow user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/users/:userId/follow', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const followerId = String(req.user.id);
+    if (followerId === targetId) {
+      return res.status(400).json({ error: 'Vous ne pouvez pas vous désabonner de vous-même' });
+    }
+
+    const targetUser = users.find((user) => String(user.id) === targetId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const filteredSubscriptions = subscriptions.filter(
+      (subscription) =>
+        !(
+          String(subscription.followerId) === followerId &&
+          String(subscription.followingId) === targetId
+        )
+    );
+    writeJSONFile(SUBSCRIPTIONS_FILE, filteredSubscriptions);
+
+    const followersCount = filteredSubscriptions.filter(
+      (subscription) => String(subscription.followingId) === targetId
+    ).length;
+    res.json({ subscribed: false, isFollowing: false, followersCount });
+  } catch (error) {
+    console.error('Unfollow user error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
