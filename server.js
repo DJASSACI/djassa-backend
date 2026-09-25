@@ -1285,6 +1285,26 @@ app.put('/api/users/profile', authenticateToken, (req, res) => {
   }
 });
 
+app.put('/api/users/profile/avatar', authenticateToken, (req, res) => {
+  try {
+    const { avatarUrl } = req.body;
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    users[userIndex].avatarUrl = avatarUrl;
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Avatar updated successfully', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Update avatar error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.put('/api/users/fcm-token', authenticateToken, (req, res) => {
   try {
     const { fcmToken } = req.body;
