@@ -99,6 +99,8 @@ const PRODUCTS_FILE = path.join(JSON_STORAGE_DIR, 'products.json');
 const ORDERS_FILE = path.join(JSON_STORAGE_DIR, 'orders.json');
 const ARTICLES_FILE = path.join(JSON_STORAGE_DIR, 'articles.json');
 const SUBSCRIPTIONS_FILE = path.join(JSON_STORAGE_DIR, 'subscriptions.json');
+const CERTIFICATION_INFO_FILE = path.join(JSON_STORAGE_DIR, 'certification_info.json');
+const PROMOTIONS_FILE = path.join(JSON_STORAGE_DIR, 'promotions.json');
 
 const ensureJSONFilesDir = () => {
   try {
@@ -260,6 +262,12 @@ const initializeData = () => {
   }
   if (!fs.existsSync(SUBSCRIPTIONS_FILE)) {
     writeJSONFile(SUBSCRIPTIONS_FILE, []);
+  }
+  if (!fs.existsSync(CERTIFICATION_INFO_FILE)) {
+    writeJSONFile(CERTIFICATION_INFO_FILE, []);
+  }
+  if (!fs.existsSync(PROMOTIONS_FILE)) {
+    writeJSONFile(PROMOTIONS_FILE, []);
   }
 };
 
@@ -522,6 +530,160 @@ app.get('/api/products/search/:query', (req, res) => {
   }
 });
 
+// PROMOTIONS ENDPOINTS
+app.get('/api/promotions', (req, res) => {
+  try {
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const activePromotions = promotions.filter((p) => p.isActive !== false);
+    res.json(activePromotions);
+  } catch (error) {
+    console.error('Get promotions error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/promotions/:id', (req, res) => {
+  try {
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotion = promotions.find((p) => p.id === parseInt(req.params.id));
+    if (!promotion) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+    res.json(promotion);
+  } catch (error) {
+    console.error('Get promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/promotions', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const {
+      name,
+      price,
+      description,
+      categorie,
+      discountPercent,
+      image,
+    } = req.body;
+
+    const imageUrl = image || 'https://via.placeholder.com/400x400?text=Promotion';
+
+    if (!name || !price || !description || !categorie || discountPercent === undefined) {
+      return res.status(400).json({
+        error: 'Name, price, description, category, and discountPercent are required',
+      });
+    }
+
+    const discount = parseInt(discountPercent);
+    if (isNaN(discount) || discount < 1 || discount > 100) {
+      return res.status(400).json({ error: 'discountPercent must be between 1 and 100' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+
+    const newPromotion = {
+      id: Date.now(),
+      name,
+      price: parseFloat(price),
+      description,
+      categorie,
+      discountPercent: discount,
+      discountedPrice: parseFloat(price) * (1 - discount / 100),
+      image: imageUrl,
+      datePublication: new Date().toISOString(),
+      isActive: true,
+    };
+
+    promotions.push(newPromotion);
+    writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    res.status(201).json({ message: 'Promotion created successfully', promotion: newPromotion });
+  } catch (error) {
+    console.error('Create promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/promotions/:id', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotionIndex = promotions.findIndex((p) => p.id === parseInt(req.params.id));
+    if (promotionIndex === -1) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+
+    const promotion = promotions[promotionIndex];
+
+    const {
+      name,
+      price,
+      image,
+      description,
+      categorie,
+      discountPercent,
+      isActive,
+    } = req.body;
+
+    const updateData = {
+      ...promotion,
+      name: name || promotion.name,
+      price: price ? parseFloat(price) : promotion.price,
+      image: image || promotion.image,
+      description: description || promotion.description,
+      categorie: categorie || promotion.categorie,
+      isActive: isActive !== undefined ? isActive : promotion.isActive,
+    };
+
+    if (discountPercent !== undefined) {
+      const discount = parseInt(discountPercent);
+      if (isNaN(discount) || discount < 1 || discount > 100) {
+        return res.status(400).json({ error: 'discountPercent must be between 1 and 100' });
+      }
+      updateData.discountPercent = discount;
+      updateData.discountedPrice = updateData.price * (1 - discount / 100);
+    }
+
+    promotions[promotionIndex] = updateData;
+    writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    res.json({ message: 'Promotion updated successfully', promotion: updateData });
+  } catch (error) {
+    console.error('Update promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/promotions/:id', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotionIndex = promotions.findIndex((p) => p.id === parseInt(req.params.id));
+    if (promotionIndex === -1) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+
+    promotions.splice(promotionIndex, 1);
+    writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    res.json({ message: 'Promotion deleted successfully' });
+  } catch (error) {
+    console.error('Delete promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.post('/api/products', authenticateToken, (req, res) => {
   try {
     const {
@@ -534,6 +696,7 @@ app.post('/api/products', authenticateToken, (req, res) => {
       paymentMethod,
       paymentAccount,
       image,
+      videoUrl,
     } = req.body;
 
     const imageUrl = image || 'https://via.placeholder.com/400x400?text=Product';
@@ -565,6 +728,7 @@ app.post('/api/products', authenticateToken, (req, res) => {
       vendeurLocalisation: vendeurLocalisation || user.address,
       datePublication: new Date().toISOString(),
       isActive: true,
+      videoUrl: videoUrl || null,
     };
 
     products.push(newProduct);
@@ -1363,6 +1527,54 @@ app.get('/api/users', authenticateToken, (req, res) => {
     res.json(usersWithoutPassword);
   } catch (error) {
     console.error('Get users error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/certification-info', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const { boutiqueNom, rectoCiUrl, versoCiUrl, lieu, photoVendeurUrl, telephone } = req.body;
+
+    if (!boutiqueNom || !rectoCiUrl || !versoCiUrl || !lieu || !photoVendeurUrl || !telephone) {
+      return res.status(400).json({ error: 'Tous les champs sont obligatoires' });
+    }
+
+    const newInfo = {
+      id: Date.now(),
+      boutiqueNom,
+      rectoCiUrl,
+      versoCiUrl,
+      lieu,
+      photoVendeurUrl,
+      telephone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const data = readJSONFile(CERTIFICATION_INFO_FILE);
+    data.push(newInfo);
+    writeJSONFile(CERTIFICATION_INFO_FILE, data);
+
+    res.status(201).json({ success: true, data: newInfo });
+  } catch (error) {
+    console.error('Save certification info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/certification-info', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const data = readJSONFile(CERTIFICATION_INFO_FILE);
+    res.json(data);
+  } catch (error) {
+    console.error('Get certification info error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
