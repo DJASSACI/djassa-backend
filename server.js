@@ -134,6 +134,7 @@ const writeJSONFile = (filePath, data) => {
 };
 
 const initializeData = () => {
+  ensureJSONFilesDir();
   if (!fs.existsSync(PRODUCTS_FILE)) {
     const defaultProducts = [
       {
