@@ -915,21 +915,42 @@ app.post('/api/orders', authenticateToken, (req, res) => {
     }
 
     const products = readJSONFile(PRODUCTS_FILE);
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const users = readJSONFile(USERS_FILE);
+
+    // Find an admin user to use as seller for promotions (admin-created)
+    const adminUser = users.find((u) => u.role === 'admin');
 
     const validatedItems = items.map((item) => {
-      const product = products.find((p) => p.id === item.id);
+      // First try to find in products
+      let product = products.find((p) => p.id === item.id);
+      let isPromotion = false;
+
+      // If not found in products, try promotions
+      if (!product) {
+        product = promotions.find((p) => p.id === item.id);
+        isPromotion = true;
+      }
+
       if (!product || !product.isActive) {
         throw new Error(`Product ID ${item.id} not found or inactive`);
       }
 
+      // For promotions, use discountedPrice; for products, use price
+      const itemPrice = isPromotion ? product.discountedPrice : product.price;
+
+      // For promotions, use admin as seller; for products, use product's vendeur
+      const seller = isPromotion ? (adminUser?.id || product.vendeur) : product.vendeur;
+
       return {
         ...item,
-        seller: product.vendeur,
+        price: itemPrice,
+        seller,
         name: product.name,
         image: product.image,
         categorie: product.categorie,
-        vendeurNom: product.vendeurNom,
-        vendeurCompte: product.vendeurCompte,
+        vendeurNom: isPromotion ? 'Djassa CI' : product.vendeurNom,
+        vendeurCompte: isPromotion ? '' : product.vendeurCompte,
       };
     });
 
