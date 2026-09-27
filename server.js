@@ -1094,6 +1094,37 @@ app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
   }
 });
 
+app.put('/api/orders/:id/delivery-info', authenticateToken, (req, res) => {
+  try {
+    const orders = readJSONFile(ORDERS_FILE);
+    const orderIndex = orders.findIndex((o) => o.id === parseInt(req.params.id));
+    if (orderIndex === -1) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orders[orderIndex];
+
+    if (order.utilisateurId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    const { nomLivraison, telLivraison, villeCommune, quartier, buyerLat, buyerLng } = req.body;
+
+    if (nomLivraison !== undefined && nomLivraison !== '') order.nomLivraison = nomLivraison;
+    if (telLivraison !== undefined && telLivraison !== '') order.telLivraison = telLivraison;
+    if (villeCommune !== undefined && villeCommune !== '') order.villeCommune = villeCommune;
+    if (quartier !== undefined && quartier !== '') order.quartier = quartier;
+    if (buyerLat !== undefined && buyerLat !== null && buyerLat !== '') order.buyerLat = parseFloat(buyerLat);
+    if (buyerLng !== undefined && buyerLng !== null && buyerLng !== '') order.buyerLng = parseFloat(buyerLng);
+
+    writeJSONFile(ORDERS_FILE, orders);
+    res.json({ message: 'Infos livraison mises à jour', order });
+  } catch (error) {
+    console.error('Update delivery info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // CHAT ROUTES
 app.use('/api/messages', authenticateToken, chatRoutes);
 
