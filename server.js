@@ -697,10 +697,12 @@ app.post('/api/products', authenticateToken, (req, res) => {
       paymentMethod,
       paymentAccount,
       image,
+      images,
       videoUrl,
     } = req.body;
 
     const imageUrl = image || 'https://via.placeholder.com/400x400?text=Product';
+    const imagesList = Array.isArray(images) ? images : [];
 
     if (!name || !price || !description || !categorie) {
       return res.status(400).json({
@@ -721,6 +723,7 @@ app.post('/api/products', authenticateToken, (req, res) => {
       name,
       price: parseFloat(price),
       image: imageUrl,
+      images: imagesList,
       description,
       categorie,
       vendeur: req.user.id,
@@ -760,6 +763,7 @@ app.put('/api/products/:id', authenticateToken, (req, res) => {
       name,
       price,
       image,
+      images,
       description,
       categorie,
       vendeurCompte,
@@ -767,11 +771,14 @@ app.put('/api/products/:id', authenticateToken, (req, res) => {
       isActive,
     } = req.body;
 
+    const imagesList = Array.isArray(images) ? images : (product.images || []);
+
     products[productIndex] = {
       ...product,
       name: name || product.name,
       price: price ? parseFloat(price) : product.price,
       image: image || product.image,
+      images: imagesList,
       description: description || product.description,
       categorie: categorie || product.categorie,
       vendeurCompte: vendeurCompte !== undefined ? vendeurCompte : product.vendeurCompte,
