@@ -570,9 +570,11 @@ app.post('/api/promotions', authenticateToken, (req, res) => {
       categorie,
       discountPercent,
       image,
+      images,
     } = req.body;
 
     const imageUrl = image || 'https://via.placeholder.com/400x400?text=Promotion';
+    const imagesList = Array.isArray(images) ? images : [];
 
     if (!name || !price || !description || !categorie || discountPercent === undefined) {
       return res.status(400).json({
@@ -596,6 +598,7 @@ app.post('/api/promotions', authenticateToken, (req, res) => {
       discountPercent: discount,
       discountedPrice: parseFloat(price) * (1 - discount / 100),
       image: imageUrl,
+      images: imagesList,
       datePublication: new Date().toISOString(),
       isActive: true,
     };
@@ -628,17 +631,23 @@ app.put('/api/promotions/:id', authenticateToken, (req, res) => {
       name,
       price,
       image,
+      images,
       description,
       categorie,
       discountPercent,
       isActive,
     } = req.body;
 
+    const imagesList = Array.isArray(images)
+      ? images
+      : (promotion.images || []);
+
     const updateData = {
       ...promotion,
       name: name || promotion.name,
       price: price ? parseFloat(price) : promotion.price,
       image: image || promotion.image,
+      images: imagesList,
       description: description || promotion.description,
       categorie: categorie || promotion.categorie,
       isActive: isActive !== undefined ? isActive : promotion.isActive,
