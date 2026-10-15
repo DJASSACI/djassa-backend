@@ -16,12 +16,120 @@ const fetch = require('node-fetch');
 const chatRoutes = require('./routes/chatRoutes');
 
 const admin = require('firebase-admin');
+let firebaseAdminReady = false;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  admin.initializeApp({
-    credential: admin.credential.cert(
-      JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-    ),
-  });
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(
+        JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+      ),
+    });
+    firebaseAdminReady = true;
+    console.log('✅ Firebase Admin initialisé');
+  } catch (e) {
+    console.error('❌ Échec initialisation Firebase Admin:', e.message);
+  }
+} else {
+  console.error('❌ FIREBASE_SERVICE_ACCOUNT manquant, notifications FCM désactivées');
+}
+
+function isFirebaseAdminInitialized() {
+  return firebaseAdminReady && admin.apps && admin.apps.length > 0;
+}
+
+// Normalise toutes les valeurs de data en chaînes (contrainte FCM).
+function fcmData(data) {
+  const out = {};
+  for (const [k, v] of Object.entries(data || {})) {
+    out[k] = v === undefined || v === null ? '' : String(v);
+  }
+  return out;
+}
+
+// Envoie une notification FCM à un jeton unique (non bloquant, ne révèle pas le jeton).
+async function sendFcmToToken(fcmToken, { title, body, type, data = {} }) {
+  if (!isFirebaseAdminInitialized()) {
+    console.error('FCM non envoyé: Firebase Admin non initialisé');
+    return false;
+  }
+  if (!fcmToken || typeof fcmToken !== 'string' || fcmToken.trim() === '') {
+    console.error('FCM non envoyé: jeton manquant ou invalide');
+    return false;
+  }
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: { title, body },
+      data: { type, ...fcmData(data) },
+    });
+    return true;
+  } catch (e) {
+    console.error('Erreur envoi FCM (jeton):', e.message || e);
+    return false;
+  }
+}
+
+// Envoie une notification FCM à un topic (non bloquant).
+async function sendFcmToTopic(topic, { title, body, type, data = {} }) {
+  if (!isFirebaseAdminInitialized()) {
+    console.error(`FCM topic ${topic} non envoyé: Firebase Admin non initialisé`);
+    return false;
+  }
+  if (!topic || typeof topic !== 'string') {
+    console.error('FCM topic non envoyé: topic manquant');
+    return false;
+  }
+  try {
+    await admin.messaging().send({
+      topic,
+      notification: { title, body },
+      data: { type, ...fcmData(data) },
+    });
+    return true;
+  } catch (e) {
+    console.error(`Erreur envoi FCM (topic ${topic}):`, e.message || e);
+    return false;
+  }
+}
+
+// Envoie une notification à plusieurs utilisateurs dédupliqués par jeton (non bloquant par destinataire).
+// users: tableau d'objets { id, fcmToken }. Ignore les doublons de jeton et les utilisateurs sans jeton valide.
+async function sendFcmToUsers(users, { title, body, type, data = {} }) {
+  if (!isFirebaseAdminInitialized()) {
+    console.error('FCM users non envoyé: Firebase Admin non initialisé');
+    return { sent: 0, skipped: 0, errors: 0 };
+  }
+  if (!Array.isArray(users) || users.length === 0) {
+    return { sent: 0, skipped: 0, errors: 0 };
+  }
+
+  const seenTokens = new Set();
+  let sent = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const u of users) {
+    if (!u || !u.fcmToken || typeof u.fcmToken !== 'string') {
+      skipped++;
+      continue;
+    }
+    const token = u.fcmToken.trim();
+    if (token === '' || seenTokens.has(token)) {
+      skipped++;
+      continue;
+    }
+    seenTokens.add(token);
+    try {
+      const ok = await sendFcmToToken(token, { title, body, type, data });
+      if (ok) sent++; else errors++;
+    } catch (e) {
+      console.error(`Erreur envoi FCM utilisateur ${u.id}:`, e.message || e);
+      errors++;
+    }
+  }
+
+  console.log(`FCM users: sent=${sent} skipped=${skipped} errors=${errors}`);
+  return { sent, skipped, errors };
 }
 
 const app = express();
@@ -557,7 +665,7 @@ app.get('/api/promotions/:id', (req, res) => {
   }
 });
 
-app.post('/api/promotions', authenticateToken, (req, res) => {
+app.post('/api/promotions', authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required' });
@@ -605,6 +713,17 @@ app.post('/api/promotions', authenticateToken, (req, res) => {
 
     promotions.push(newPromotion);
     writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    // Notification promotionnelle au topic global (après enregistrement effectif).
+    sendFcmToTopic('djassaci_all', {
+      title: 'Nouvelle promotion',
+      body: name,
+      type: 'promotion',
+      data: {
+        promotionId: String(newPromotion.id),
+        promotionName: name,
+      },
+    }).catch(() => {}); // non bloquant
 
     res.status(201).json({ message: 'Promotion created successfully', promotion: newPromotion });
   } catch (error) {
@@ -694,7 +813,7 @@ app.delete('/api/promotions/:id', authenticateToken, (req, res) => {
   }
 });
 
-app.post('/api/products', authenticateToken, (req, res) => {
+app.post('/api/products', authenticateToken, async (req, res) => {
   try {
     const {
       name,
@@ -746,6 +865,35 @@ app.post('/api/products', authenticateToken, (req, res) => {
 
     products.push(newProduct);
     writeJSONFile(PRODUCTS_FILE, products);
+
+    // Notifier les abonnés du vendeur (nouveau produit), excluant le vendeur lui-même.
+    const sellerId = String(req.user.id);
+    const sellerShopName = user.boutiqueNom || `${user.prenom} ${user.nom}` || 'Boutique';
+    try {
+      const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+      const followerEntries = subscriptions.filter(
+        (s) => s && String(s.followingId) === sellerId
+      );
+      // Dédupliquer les followerId (un même utilisateur ne suit qu'une fois, mais on sécurise).
+      const uniqueFollowerIds = [...new Set(followerEntries.map((s) => String(s.followerId)))];
+      const followerUsers = users.filter(
+        (u) => u && uniqueFollowerIds.includes(String(u.id)) && String(u.id) !== sellerId
+      );
+
+      if (followerUsers.length > 0) {
+        sendFcmToUsers(followerUsers, {
+          title: `Nouvelle publication de ${sellerShopName}`,
+          body: `${name} vient d'être publié.`,
+          type: 'followed_seller_product',
+          data: {
+            productId: String(newProduct.id),
+            sellerId: sellerId,
+          },
+        }).catch(() => {}); // non bloquant
+      }
+    } catch (e) {
+      console.error('Erreur notification abonnés nouveau produit:', e.message || e);
+    }
 
     res.status(201).json({ message: 'Product created successfully', product: newProduct });
   } catch (error) {
@@ -1237,6 +1385,28 @@ app.put('/api/admin/users/:id/verify-seller', authenticateToken, (req, res) => {
 
     writeJSONFile(USERS_FILE, users);
 
+    // Notification de certification au vendeur (pas à l'admin), anti-doublon si déjà certifié.
+    const nowForNotifAdmin = new Date();
+    const wasAlreadyCertifiedAdmin =
+      users[userIndex].sellerVerified === true &&
+      users[userIndex].sellerVerifiedUntil &&
+      new Date(users[userIndex].sellerVerifiedUntil).getTime() > nowForNotifAdmin.getTime();
+
+    if (!wasAlreadyCertifiedAdmin) {
+      const sellerAdmin = users[userIndex];
+      if (sellerAdmin && sellerAdmin.fcmToken) {
+        sendFcmToToken(sellerAdmin.fcmToken, {
+          title: 'Boutique certifiée',
+          body: 'Votre certification vendeur est activée pour 30 jours.',
+          type: 'seller_certified',
+          data: {
+            userId: String(sellerAdmin.id),
+            sellerVerifiedUntil: until.toISOString(),
+          },
+        }).catch(() => {}); // non bloquant
+      }
+    }
+
     const { password: _, ...userWithoutPassword } = users[userIndex];
     res.json({ message: 'Seller verified successfully (30 days)', user: userWithoutPassword });
   } catch (error) {
@@ -1291,6 +1461,28 @@ app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
     };
 
     writeJSONFile(USERS_FILE, users);
+
+    // Notification de certification au vendeur (lui-même), anti-doublon si déjà certifié.
+    const nowForNotifUser = new Date();
+    const wasAlreadyCertifiedUser =
+      users[userIndex].sellerVerified === true &&
+      users[userIndex].sellerVerifiedUntil &&
+      new Date(users[userIndex].sellerVerifiedUntil).getTime() > nowForNotifUser.getTime();
+
+    if (!wasAlreadyCertifiedUser) {
+      const sellerUser = users[userIndex];
+      if (sellerUser && sellerUser.fcmToken) {
+        sendFcmToToken(sellerUser.fcmToken, {
+          title: 'Boutique certifiée',
+          body: 'Votre certification vendeur est activée pour 30 jours.',
+          type: 'seller_certified',
+          data: {
+            userId: String(sellerUser.id),
+            sellerVerifiedUntil: until.toISOString(),
+          },
+        }).catch(() => {}); // non bloquant
+      }
+    }
 
     const { password: _, ...userWithoutPassword } = users[userIndex];
     res.json({ message: 'Seller verified successfully (30 days)', user: userWithoutPassword });
@@ -1841,11 +2033,13 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   const orderId = metadata.order_id;
   const paymentType = metadata.payment_type; // 'order' | 'seller_certification'
 
-  // 1) Paiements des commandes (flux existant)
+  // 1) Paiements des commandes (flux existant + notifications push)
   const orders = readJSONFile(ORDERS_FILE);
   const index = orders.findIndex((o) => o.id == orderId);
 
   if (index !== -1) {
+    const oldStatut = orders[index].statut;
+
     if (event === 'payment.success') {
       orders[index].statut = 'payée';
       io.emit('payment_update', { orderId, status: 'payée' });
@@ -1857,9 +2051,36 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
     }
 
     writeJSONFile(ORDERS_FILE, orders);
+
+    // Notification push à l'acheteur uniquement si le statut a réellement changé.
+    if (orders[index].statut !== oldStatut) {
+      const buyerId = orders[index].utilisateurId;
+      const users = readJSONFile(USERS_FILE);
+      const buyer = users.find((u) => u.id == buyerId);
+
+      if (buyer && buyer.fcmToken) {
+        const orderNumber = orders[index].id;
+        if (event === 'payment.success') {
+          sendFcmToToken(buyer.fcmToken, {
+            title: 'Paiement confirmé',
+            body: `Votre commande #${orderNumber} est payée !`,
+            type: 'payment_confirmed',
+            data: { orderId: String(orders[index].id) },
+          }).catch(() => {}); // non bloquant
+        } else if (event === 'payment.failed') {
+          sendFcmToToken(buyer.fcmToken, {
+            title: 'Paiement échoué',
+            body: `Votre commande #${orderNumber} n'a pas pu être réglée.`,
+            type: 'payment_failed',
+            data: { orderId: String(orders[index].id) },
+          }).catch(() => {}); // non bloquant
+        }
+      }
+    }
   }
 
-  // 2) Paiement certification vendeur
+  // 2) Paiement certification vendeur (webhook GeniusPay)
+  let certificationNotified = false;
   if (paymentType === 'seller_certification' && event === 'payment.success') {
     const certificationUserId = metadata.user_id;
     if (certificationUserId) {
@@ -1868,6 +2089,11 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
       if (userIndex !== -1) {
         const now = new Date();
         const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+        const wasAlreadyCertified =
+          users[userIndex].sellerVerified === true &&
+          users[userIndex].sellerVerifiedUntil &&
+          new Date(users[userIndex].sellerVerifiedUntil).getTime() > now.getTime();
 
         users[userIndex] = {
           ...users[userIndex],
@@ -1878,6 +2104,23 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
         };
 
         writeJSONFile(USERS_FILE, users);
+
+        // Notifier le vendeur (pas l'admin), éviter les doublons si déjà certifié.
+        if (!wasAlreadyCertified) {
+          const seller = users[userIndex];
+          if (seller && seller.fcmToken) {
+            sendFcmToToken(seller.fcmToken, {
+              title: 'Boutique certifiée',
+              body: 'Votre certification vendeur est activée pour 30 jours.',
+              type: 'seller_certified',
+              data: {
+                userId: String(seller.id),
+                sellerVerifiedUntil: until.toISOString(),
+              },
+            }).catch(() => {}); // non bloquant
+            certificationNotified = true;
+          }
+        }
       }
     }
   }
@@ -1986,10 +2229,11 @@ app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
 // ---- Seller certification auto-expiration job (runs periodically) ----
 // Important: this is a lightweight JSON-file update to ensure sellerVerified
 // is automatically set to false after sellerVerifiedUntil expires.
-// Runs every 10 minutes.
+// Runs every 10 minutes. Envoie aussi un rappel J-1 avant expiration.
 const SELLER_VERIFICATION_CRON_MS = 10 * 60 * 1000;
+const REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000; // ~24h avant expiration
 
-function autoExpireSellerVerifications() {
+async function autoExpireSellerVerifications() {
   try {
     const users = readJSONFile(USERS_FILE);
     if (!Array.isArray(users) || users.length === 0) return;
@@ -1997,22 +2241,57 @@ function autoExpireSellerVerifications() {
     let changed = false;
     const nowMs = Date.now();
 
-    users.forEach((u, idx) => {
-      if (!u || !u.sellerVerifiedUntil) return;
+    for (const u of users) {
+      if (!u || !u.sellerVerifiedUntil) continue;
 
       const untilDate = new Date(u.sellerVerifiedUntil);
-      if (Number.isNaN(untilDate.getTime())) return;
+      if (Number.isNaN(untilDate.getTime())) continue;
 
-      const active = untilDate.getTime() > nowMs;
+      const untilMs = untilDate.getTime();
+      const active = untilMs > nowMs;
+
+      // Expiration automatique existante: si certifié et expiré, on désactive.
       if (u.sellerVerified === true && !active) {
-        users[idx].sellerVerified = false;
+        u.sellerVerified = false;
         changed = true;
       }
-    });
+
+      // Rappel J-1: certification active et expirant dans les 24h.
+      if (u.sellerVerified === true && active) {
+        const msUntilExpiry = untilMs - nowMs;
+        const alreadyReminded =
+          u.certReminderSentUntil &&
+          new Date(u.certReminderSentUntil).getTime() >= untilMs;
+
+        if (msUntilExpiry > 0 && msUntilExpiry <= REMINDER_WINDOW_MS && !alreadyReminded) {
+          if (u.fcmToken && typeof u.fcmToken === 'string' && u.fcmToken.trim() !== '') {
+            try {
+              const ok = await sendFcmToToken(u.fcmToken, {
+                title: 'Votre certification expire bientôt',
+                body: 'Votre certification vendeur expire demain. Renouvelez-la pour conserver votre badge.',
+                type: 'certification_expiring_soon',
+                data: {
+                  userId: String(u.id),
+                  sellerVerifiedUntil: u.sellerVerifiedUntil,
+                },
+              });
+              // Marquer comme envoyé uniquement si Firebase a accepté.
+              if (ok) {
+                u.certReminderSentUntil = u.sellerVerifiedUntil;
+                changed = true;
+              }
+            } catch (e) {
+              // Échec d'envoi: on ne marque pas, nouvelle tentative au prochain cycle.
+              console.error(`Rappel certification échoué user ${u.id}:`, e.message || e);
+            }
+          }
+        }
+      }
+    }
 
     if (changed) {
       writeJSONFile(USERS_FILE, users);
-      console.log('⏳ Auto-expired seller verifications (users.json updated)');
+      console.log('⏳ Auto-expire/reminder seller verifications (users.json updated)');
     }
   } catch (e) {
     console.error('Auto-expire seller verifications failed:', e);
