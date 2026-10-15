@@ -557,6 +557,65 @@ app.post('/api/auth/refresh', authenticateToken, (req, res) => {
   }
 });
 
+// ===== CHANGEMENT DE MOT DE PASSE (profil) =====
+app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+
+    const user = users[userIndex];
+    const { oldPassword, newPassword, confirmPassword } = req.body;
+
+    if (!oldPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'Tous les champs sont requis' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'Les nouveaux mots de passe ne correspondent pas' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères' });
+    }
+
+    const hashedOldPassword = crypto
+      .createHash('sha256')
+      .update(oldPassword)
+      .digest('hex');
+
+    const oldPasswordValid = user.password === oldPassword || user.password === hashedOldPassword;
+
+    if (!oldPasswordValid) {
+      return res.status(401).json({ error: 'L\'ancien mot de passe est incorrect' });
+    }
+
+    const hashedNewPassword = crypto
+      .createHash('sha256')
+      .update(newPassword)
+      .digest('hex');
+
+    users[userIndex] = {
+      ...users[userIndex],
+      password: hashedNewPassword,
+      mustChangePassword: false,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({
+      message: 'Votre mot de passe a été modifié avec succès.',
+      user: userWithoutPassword,
+    });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Server error during password change' });
+  }
+});
+
 // ===== MOT DE PASSE OUBLIÉ =====
 // Demande de réinitialisation (statut pending, aucun mot de passe stocké).
 app.post('/api/auth/forgot-password/request', (req, res) => {
