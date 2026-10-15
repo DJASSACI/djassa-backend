@@ -209,6 +209,7 @@ const ARTICLES_FILE = path.join(JSON_STORAGE_DIR, 'articles.json');
 const SUBSCRIPTIONS_FILE = path.join(JSON_STORAGE_DIR, 'subscriptions.json');
 const CERTIFICATION_INFO_FILE = path.join(JSON_STORAGE_DIR, 'certification_info.json');
 const PROMOTIONS_FILE = path.join(JSON_STORAGE_DIR, 'promotions.json');
+const PASSWORD_RESULTS_FILE = path.join(JSON_STORAGE_DIR, 'password_resets.json');
 
 const ensureJSONFilesDir = () => {
   try {
@@ -378,6 +379,9 @@ const initializeData = () => {
   if (!fs.existsSync(PROMOTIONS_FILE)) {
     writeJSONFile(PROMOTIONS_FILE, []);
   }
+  if (!fs.existsSync(PASSWORD_RESULTS_FILE)) {
+    writeJSONFile(PASSWORD_RESULTS_FILE, []);
+  }
 };
 
 initializeData();
@@ -505,7 +509,10 @@ app.post('/api/auth/login', (req, res) => {
     res.json({
       message: 'Login successful',
       token,
-      user: userWithoutPassword,
+      user: {
+        ...userWithoutPassword,
+        mustChangePassword: user.mustChangePassword === true,
+      },
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -549,6 +556,176 @@ app.post('/api/auth/refresh', authenticateToken, (req, res) => {
     res.status(500).json({ error: 'Server error during token refresh' });
   }
 });
+
+// ===== MOT DE PASSE OUBLIÉ =====
+// Demande de réinitialisation (statut pending, aucun mot de passe stocké).
+app.post('/api/auth/forgot-password/request', (req, res) => {
+  try {
+    const { numero } = req.body;
+
+    if (!numero || String(numero).trim() === '') {
+      return res.status(400).json({ error: 'Le numéro de téléphone est requis' });
+    }
+
+    const users = readJSONFile(USERS_FILE);
+    const user = users.find(
+      (u) => u.numero === numero || u.numero.toLowerCase() === numero.toLowerCase()
+    );
+
+    if (!user) {
+      return res.status(400).json({
+        error: 'Aucun compte n\'est associé à ce numéro. Vérifiez votre saisie.',
+      });
+    }
+
+    const resets = readJSONFile(PASSWORD_RESULTS_FILE);
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 heure
+
+    resets.push({
+      id: Date.now(),
+      numero: user.numero,
+      userId: user.id,
+      token,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      expiresAt,
+    });
+
+    writeJSONFile(PASSWORD_RESULTS_FILE, resets);
+
+    res.json({
+      message: 'Demande de réinitialisation créée. Une vérification est requise via WhatsApp.',
+    });
+  } catch (error) {
+    console.error('Forgot password request error:', error);
+    res.status(500).json({ error: 'Server error during password reset request' });
+  }
+});
+
+// Validation manuelle par l'administrateur après vérification WhatsApp.
+app.post('/api/auth/forgot-password/approve', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const { numero, tempPassword } = req.body;
+
+    if (!numero || !tempPassword || tempPassword.length < 6) {
+      return res.status(400).json({
+        error: 'Numéro et mot de passe temporaire (6 caractères minimum) requis',
+      });
+    }
+
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex(
+      (u) => u.numero === numero || u.numero.toLowerCase() === numero.toLowerCase()
+    );
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+
+    const resets = readJSONFile(PASSWORD_RESULTS_FILE);
+    const resetIndex = resets.findIndex(
+      (r) =>
+        String(r.userId) === String(users[userIndex].id) &&
+        r.status === 'pending' &&
+        new Date(r.expiresAt).getTime() > Date.now()
+    );
+    if (resetIndex === -1) {
+      return res.status(400).json({ error: 'Aucune demande de réinitialisation en attente' });
+    }
+
+    const hashedTempPassword = crypto
+      .createHash('sha256')
+      .update(tempPassword)
+      .digest('hex');
+
+    users[userIndex] = {
+      ...users[userIndex],
+      password: hashedTempPassword,
+      mustChangePassword: true,
+    };
+
+    resets[resetIndex] = {
+      ...resets[resetIndex],
+      status: 'approved',
+      approvedAt: new Date().toISOString(),
+      approvedBy: req.user.id,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+    writeJSONFile(PASSWORD_RESULTS_FILE, resets);
+
+    res.json({
+      message: 'Demande validée. Mot de passe temporaire défini.',
+    });
+  } catch (error) {
+    console.error('Forgot password approve error:', error);
+    res.status(500).json({ error: 'Server error during password reset approval' });
+  }
+});
+
+// Réinitialisation du mot de passe après connexion avec le mot de passe temporaire.
+app.post('/api/auth/forgot-password/reset', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+
+    const user = users[userIndex];
+
+    if (user.mustChangePassword !== true) {
+      return res.status(400).json({ error: 'Aucune réinitialisation de mot de passe requise' });
+    }
+
+    const { tempPassword, newPassword, confirmPassword } = req.body;
+
+    if (!tempPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'Tous les champs sont requis' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'Les mots de passe ne correspondent pas' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères' });
+    }
+
+    const hashedTempPassword = crypto
+      .createHash('sha256')
+      .update(tempPassword)
+      .digest('hex');
+
+    if (user.password !== hashedTempPassword) {
+      return res.status(401).json({ error: 'Mot de passe temporaire incorrect' });
+    }
+
+    const hashedNewPassword = crypto
+      .createHash('sha256')
+      .update(newPassword)
+      .digest('hex');
+
+    users[userIndex] = {
+      ...users[userIndex],
+      password: hashedNewPassword,
+      mustChangePassword: false,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    res.json({ message: 'Mot de passe mis à jour avec succès' });
+  } catch (error) {
+    console.error('Forgot password reset error:', error);
+    res.status(500).json({ error: 'Server error during password reset' });
+  }
+});
+
+// ===== FIN MOT DE PASSE OUBLIÉ =====
 
 // PRODUCTS
 app.get('/api/products', (req, res) => {
