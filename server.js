@@ -421,7 +421,7 @@ app.post('/api/auth/register', (req, res) => {
     const existingUser = users.find((u) => u.numero === numero);
     if (existingUser) {
       return res.status(400).json({
-        error: 'User with this phone number already exists',
+        error: 'Ce numéro de téléphone est déjà associé à un compte DJASSACI. Connectez-vous à votre compte ou utilisez un autre numéro.',
       });
     }
 
@@ -574,7 +574,7 @@ app.post('/api/auth/change-password', authenticateToken, (req, res) => {
     }
 
     if (newPassword !== confirmPassword) {
-      return res.status(400).json({ error: 'Les nouveaux mots de passe ne correspondent pas' });
+      return res.status(400).json({ error: 'Les deux nouveaux mots de passe ne correspondent pas. Vérifiez votre saisie et réessayez.' });
     }
 
     if (newPassword.length < 6) {
@@ -589,7 +589,7 @@ app.post('/api/auth/change-password', authenticateToken, (req, res) => {
     const oldPasswordValid = user.password === oldPassword || user.password === hashedOldPassword;
 
     if (!oldPasswordValid) {
-      return res.status(401).json({ error: 'L\'ancien mot de passe est incorrect' });
+      return res.status(401).json({ error: 'Votre ancien mot de passe est incorrect. Vérifiez votre saisie et réessayez.' });
     }
 
     const hashedNewPassword = crypto
@@ -633,7 +633,7 @@ app.post('/api/auth/forgot-password/request', (req, res) => {
 
     if (!user) {
       return res.status(400).json({
-        error: 'Aucun compte n\'est associé à ce numéro. Vérifiez votre saisie.',
+        error: 'Aucun compte DJASSACI n\'est associé à ce numéro de téléphone. Vérifiez votre numéro et réessayez.',
       });
     }
 
