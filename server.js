@@ -2,12 +2,47 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const bcryptjs = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const socketIo = require('socket.io');
 require('dotenv').config();
+
+// ===== HASHAGE DE MOT DE PASSE (bcrypt avec migration SHA-256 / texte clair) =====
+async function hashPassword(password) {
+  return await bcryptjs.hash(password, 10);
+}
+
+async function verifyPassword(password, storedHash) {
+  if (!storedHash) return false;
+
+  // Hash bcrypt existant ($2a$, $2b$, $2y$)
+  if (
+    storedHash.startsWith('$2a$') ||
+    storedHash.startsWith('$2b$') ||
+    storedHash.startsWith('$2y$')
+  ) {
+    return await bcryptjs.compare(password, storedHash);
+  }
+
+  // Fallback SHA-256 (comptes existants)
+  const sha256Hash = crypto.createHash('sha256').update(password).digest('hex');
+  if (storedHash === sha256Hash) return true;
+
+  // Fallback texte clair (comptes très anciens)
+  if (storedHash === password) return true;
+
+  return false;
+}
+
+async function hashAndMigrate(password, users, userIndex) {
+  const newHash = await bcryptjs.hash(password, 10);
+  users[userIndex] = { ...users[userIndex], password: newHash };
+  writeJSONFile(USERS_FILE, users);
+  return newHash;
+}
 
 const GENIUSPAY_API_KEY = process.env.GENIUSPAY_API_KEY;
 const GENIUSPAY_SECRET_KEY = process.env.GENIUSPAY_SECRET_KEY;
@@ -143,7 +178,11 @@ io.on('connection', (socket) => {
   });
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'djassa_ci_secret_key_2024';
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  throw new Error("La variable d'environnement JWT_SECRET est obligatoire.");
+}
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
@@ -232,14 +271,18 @@ const readJSONFile = (filePath) => {
   }
 };
 
+let writeQueue = Promise.resolve();
 const writeJSONFile = (filePath, data) => {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
-    return true;
-  } catch (error) {
-    console.error(`Error writing ${filePath}:`, error);
-    return false;
-  }
+  writeQueue = writeQueue.then(() => {
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+      return true;
+    } catch (error) {
+      console.error(`Error writing ${filePath}:`, error);
+      return false;
+    }
+  });
+  return writeQueue;
 };
 
 const initializeData = () => {
@@ -404,7 +447,7 @@ const authenticateToken = (req, res, next) => {
 };
 
 // AUTH ROUTES
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   try {
     const { nom, prenom, numero, address, password } = req.body;
 
@@ -425,10 +468,7 @@ app.post('/api/auth/register', (req, res) => {
       });
     }
 
-    const hashedPassword = crypto
-      .createHash('sha256')
-      .update(password)
-      .digest('hex');
+    const hashedPassword = await hashPassword(password);
 
     const newUser = {
       id: Date.now(),
@@ -463,7 +503,7 @@ app.post('/api/auth/register', (req, res) => {
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { numero, password } = req.body;
 
@@ -482,20 +522,21 @@ app.post('/api/auth/login', (req, res) => {
       return res.status(401).json({ error: 'Utilisateur non trouvé' });
     }
 
-    const hashedPassword = crypto
-      .createHash('sha256')
-      .update(password)
-      .digest('hex');
-
-    const passwordValid = user.password === password || user.password === hashedPassword;
+    const passwordValid = await verifyPassword(password, user.password);
 
     if (!passwordValid) {
       return res.status(401).json({ message: 'Mot de passe incorrect' });
     }
 
-    if (user.password === password) {
-      user.password = hashedPassword;
-      writeJSONFile(USERS_FILE, users);
+    // Migration vers bcrypt si le hash stocké n'est pas déjà bcrypt
+    if (
+      user.password &&
+      !user.password.startsWith('$2a$') &&
+      !user.password.startsWith('$2b$') &&
+      !user.password.startsWith('$2y$')
+    ) {
+      const userIndex = users.findIndex((u) => u.id === user.id);
+      user.password = await hashAndMigrate(password, users, userIndex);
     }
 
     const token = jwt.sign(
@@ -558,7 +599,7 @@ app.post('/api/auth/refresh', authenticateToken, (req, res) => {
 });
 
 // ===== CHANGEMENT DE MOT DE PASSE (profil) =====
-app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
     const userIndex = users.findIndex((u) => u.id === req.user.id);
@@ -581,21 +622,13 @@ app.post('/api/auth/change-password', authenticateToken, (req, res) => {
       return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères' });
     }
 
-    const hashedOldPassword = crypto
-      .createHash('sha256')
-      .update(oldPassword)
-      .digest('hex');
-
-    const oldPasswordValid = user.password === oldPassword || user.password === hashedOldPassword;
+    const oldPasswordValid = await verifyPassword(oldPassword, user.password);
 
     if (!oldPasswordValid) {
       return res.status(401).json({ error: 'Votre ancien mot de passe est incorrect. Vérifiez votre saisie et réessayez.' });
     }
 
-    const hashedNewPassword = crypto
-      .createHash('sha256')
-      .update(newPassword)
-      .digest('hex');
+    const hashedNewPassword = await hashPassword(newPassword);
 
     users[userIndex] = {
       ...users[userIndex],
@@ -663,7 +696,7 @@ app.post('/api/auth/forgot-password/request', (req, res) => {
 });
 
 // Validation manuelle par l'administrateur après vérification WhatsApp.
-app.post('/api/auth/forgot-password/approve', authenticateToken, (req, res) => {
+app.post('/api/auth/forgot-password/approve', authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required' });
@@ -696,10 +729,7 @@ app.post('/api/auth/forgot-password/approve', authenticateToken, (req, res) => {
       return res.status(400).json({ error: 'Aucune demande de réinitialisation en attente' });
     }
 
-    const hashedTempPassword = crypto
-      .createHash('sha256')
-      .update(tempPassword)
-      .digest('hex');
+    const hashedTempPassword = await hashPassword(tempPassword);
 
     users[userIndex] = {
       ...users[userIndex],
@@ -727,7 +757,7 @@ app.post('/api/auth/forgot-password/approve', authenticateToken, (req, res) => {
 });
 
 // Réinitialisation du mot de passe après connexion avec le mot de passe temporaire.
-app.post('/api/auth/forgot-password/reset', authenticateToken, (req, res) => {
+app.post('/api/auth/forgot-password/reset', authenticateToken, async (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
     const userIndex = users.findIndex((u) => u.id === req.user.id);
@@ -755,19 +785,13 @@ app.post('/api/auth/forgot-password/reset', authenticateToken, (req, res) => {
       return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères' });
     }
 
-    const hashedTempPassword = crypto
-      .createHash('sha256')
-      .update(tempPassword)
-      .digest('hex');
+    const tempPasswordValid = await verifyPassword(tempPassword, user.password);
 
-    if (user.password !== hashedTempPassword) {
+    if (!tempPasswordValid) {
       return res.status(401).json({ error: 'Mot de passe temporaire incorrect' });
     }
 
-    const hashedNewPassword = crypto
-      .createHash('sha256')
-      .update(newPassword)
-      .digest('hex');
+    const hashedNewPassword = await hashPassword(newPassword);
 
     users[userIndex] = {
       ...users[userIndex],
@@ -1582,6 +1606,9 @@ function refreshSellerVerifiedStatus(user) {
 // Alias admin (pour que le dashboard admin puisse certifier sans changer le Flutter)
 app.put('/api/admin/users/:id/verify-seller', authenticateToken, (req, res) => {
   try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
     const { sellerCompte, sellerLocalisation } = req.body || {};
 
     const users = readJSONFile(USERS_FILE);
