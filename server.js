@@ -44,6 +44,59 @@ async function hashAndMigrate(password, users, userIndex) {
   return newHash;
 }
 
+// ===== MAWA assistant endpoint =====
+const mawaRateLimits = new Map();
+app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
+  try {
+    const message = (req.body && typeof req.body.message === 'string') ? req.body.message.trim() : '';
+    if (!message) return res.status(400).json({ error: 'Message requis' });
+    if (message.length > 2000) return res.status(400).json({ error: 'Message trop long (max 2000 caracteres)' });
+
+    const userId = String(req.user.id);
+    const now = Date.now();
+    const windowMs = 60 * 1000;
+    const maxReq = 10;
+    const entry = mawaRateLimits.get(userId) || { count: 0, reset: now + windowMs };
+    if (now > entry.reset) { entry.count = 0; entry.reset = now + windowMs; }
+    entry.count += 1;
+    mawaRateLimits.set(userId, entry);
+    if (entry.count > maxReq) return res.status(429).json({ error: 'Trop de requetes, reessayez plus tard' });
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'Service indisponible' });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    const systemPrompt = "Tu es MAWA, l'assistant officiel de DJASSACI. Reponds en francais simple. Aide a utiliser l'application. Ne jamais inventer de donnees. Oriente vers le support humain si necessaire.";
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: message }],
+        max_tokens: 500,
+        temperature: 0.7,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      if (response.status === 429) return res.status(429).json({ error: 'Service temporairement limite' });
+      return res.status(502).json({ error: 'Erreur du service d\'assistant' });
+    }
+
+    const data = await response.json();
+    const reply = data?.choices?.[0]?.message?.content || "Desole, je n'ai pas pu repondre.";
+    return res.json({ reply });
+  } catch (error) {
+    if (error && error.name === 'AbortError') return res.status(504).json({ error: 'Delai depasse' });
+    console.error('MAWA error:', error && error.message ? error.message : error);
+    return res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
 const GENIUSPAY_API_KEY = process.env.GENIUSPAY_API_KEY;
 const GENIUSPAY_SECRET_KEY = process.env.GENIUSPAY_SECRET_KEY;
 const fetch = require('node-fetch');
