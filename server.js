@@ -498,6 +498,8 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
     clearTimeout(timeout);
 
     if (!response.ok) {
+      const errText = await response.text();
+      console.error('Gemini error:', response.status, errText);
       if (response.status === 429) return res.status(429).json({ error: 'Service temporairement limite' });
       return res.status(502).json({ error: 'Erreur du service d\'assistant' });
     }
