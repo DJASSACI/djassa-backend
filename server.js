@@ -446,6 +446,19 @@ const authenticateToken = (req, res, next) => {
   });
 };
 const mawaRateLimits = new Map();
+// Demandes de notification MAWA en attente (en mémoire; perdues au redémarrage).
+const mawaNotificationRequests = new Map();
+const MAWA_NOTIF_TTL_MS = 10 * 60 * 1000;
+const MAWA_NOTIF_MAX_ATTEMPTS = 3;
+
+function cleanupMawaNotificationRequests() {
+  const now = Date.now();
+  for (const [id, req] of mawaNotificationRequests.entries()) {
+    if (!req || now - req.createdAt > MAWA_NOTIF_TTL_MS || (req.attempts || 0) >= MAWA_NOTIF_MAX_ATTEMPTS) {
+      mawaNotificationRequests.delete(id);
+    }
+  }
+}
 // ===== MAWA assistant endpoint =====
 app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
   try {
@@ -453,6 +466,7 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
     if (!message) return res.status(400).json({ error: 'Message requis' });
     if (message.length > 2000) return res.status(400).json({ error: 'Message trop long (max 2000 caracteres)' });
 
+    const requestId = (req.body && typeof req.body.requestId === 'string') ? req.body.requestId.trim() : '';
     const userId = String(req.user.id);
     const now = Date.now();
     const windowMs = 60 * 1000;
@@ -491,10 +505,69 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
 
     const data = await response.json();
     const reply = data?.choices?.[0]?.message?.content || "Desole, je n'ai pas pu repondre.";
+
+    // Notification MAWA si une demande en attente correspond
+    cleanupMawaNotificationRequests();
+    if (requestId) {
+      const pending = mawaNotificationRequests.get(requestId);
+      if (pending && String(pending.userId) === userId && !pending.processed && Date.now() - pending.createdAt <= MAWA_NOTIF_TTL_MS) {
+        const users = readJSONFile(USERS_FILE);
+        const user = users.find((u) => String(u.id) === userId);
+        const token = user && user.fcmToken;
+        if (token && typeof token === 'string' && token.trim() !== '') {
+          pending.attempts = (pending.attempts || 0) + 1;
+          try {
+            const ok = await sendFcmToToken(token.trim(), {
+              title: 'MAWA a une réponse pour vous',
+              body: '🤖 MAWA a une réponse pour vous.',
+              type: 'mawa_reply',
+              data: { requestId },
+            });
+            if (ok) {
+              pending.processed = true;
+              mawaNotificationRequests.delete(requestId);
+            } else if (pending.attempts >= MAWA_NOTIF_MAX_ATTEMPTS) {
+              mawaNotificationRequests.delete(requestId);
+            }
+          } catch (e) {
+            if (pending.attempts >= MAWA_NOTIF_MAX_ATTEMPTS) mawaNotificationRequests.delete(requestId);
+          }
+        } else {
+          mawaNotificationRequests.delete(requestId);
+        }
+      }
+    }
+
     return res.json({ reply });
   } catch (error) {
     if (error && error.name === 'AbortError') return res.status(504).json({ error: 'Delai depasse' });
     console.error('MAWA error:', error && error.message ? error.message : error);
+    return res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ===== MAWA notification request =====
+app.post('/api/mawa/notification-request', authenticateToken, (req, res) => {
+  try {
+    cleanupMawaNotificationRequests();
+    const userId = String(req.user.id);
+    const requestId = (req.body && typeof req.body.requestId === 'string' && req.body.requestId.trim() !== '')
+      ? req.body.requestId.trim()
+      : crypto.randomUUID();
+
+    const users = readJSONFile(USERS_FILE);
+    const user = users.find((u) => String(u.id) === userId);
+    const token = user && user.fcmToken;
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return res.status(400).json({ error: 'FCM token manquant' });
+    }
+
+    if (!mawaNotificationRequests.has(requestId)) {
+      mawaNotificationRequests.set(requestId, { userId, createdAt: Date.now(), attempts: 0, processed: false });
+    }
+    return res.json({ requestId });
+  } catch (error) {
+    console.error('MAWA notification request error:', error && error.message ? error.message : error);
     return res.status(500).json({ error: 'Erreur serveur' });
   }
 });
