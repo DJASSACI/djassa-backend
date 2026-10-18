@@ -463,7 +463,7 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
     mawaRateLimits.set(userId, entry);
     if (entry.count > maxReq) return res.status(429).json({ error: 'Trop de requetes, reessayez plus tard' });
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) return res.status(503).json({ error: 'Service indisponible' });
 
     const controller = new AbortController();
@@ -471,11 +471,11 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
 
     const systemPrompt = "Tu es MAWA, l'assistant officiel de DJASSACI. Reponds en francais simple. Aide a utiliser l'application. Ne jamais inventer de donnees. Oriente vers le support humain si necessaire.";
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'llama-3.1-8b-instant',
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: message }],
         max_tokens: 500,
         temperature: 0.7,
