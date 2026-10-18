@@ -477,22 +477,21 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
     mawaRateLimits.set(userId, entry);
     if (entry.count > maxReq) return res.status(429).json({ error: 'Trop de requetes, reessayez plus tard' });
 
-    const apiKey = process.env.GROQ_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return res.status(503).json({ error: 'Service indisponible' });
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
 
-    const systemPrompt = "Tu es MAWA, l'assistant officiel de DJASSACI. Reponds en francais simple. Aide a utiliser l'application. Ne jamais inventer de donnees. Oriente vers le support humain si necessaire.";
+    const systemPrompt = "Tu es MAWA, l'assistant officiel de DJASSACI. Reponds en francais simple. Tu ne reponds qu'aux questions concernant DJASSACI : produits, categories, vendeurs, boutiques, certification, commandes, paiements GeniusPay, comptes, connexion et utilisation de l'application. Pour toute question hors sujet, reponds poliment que MAWA est specialisee dans DJASSACI. Ne jamais inventer de donnees, de prix, de statuts de commande ou d'informations privees. Oriente vers le support humain si necessaire.";
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: message }],
-        max_tokens: 500,
-        temperature: 0.7,
+        contents: [{ role: 'user', parts: [{ text: message }] }],
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
       }),
       signal: controller.signal,
     });
@@ -504,7 +503,7 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
     }
 
     const data = await response.json();
-    const reply = data?.choices?.[0]?.message?.content || "Desole, je n'ai pas pu repondre.";
+    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Desole, je n'ai pas pu repondre.";
 
     // Notification MAWA si une demande en attente correspond
     cleanupMawaNotificationRequests();
