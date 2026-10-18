@@ -485,7 +485,7 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
 
     const systemPrompt = "Tu es MAWA, l'assistant officiel de DJASSACI. Reponds en francais simple. Tu ne reponds qu'aux questions concernant DJASSACI : produits, categories, vendeurs, boutiques, certification, commandes, paiements GeniusPay, comptes, connexion et utilisation de l'application. Pour toute question hors sujet, reponds poliment que MAWA est specialisee dans DJASSACI. Ne jamais inventer de donnees, de prix, de statuts de commande ou d'informations privees. Oriente vers le support humain si necessaire.";
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
