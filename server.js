@@ -9,6 +9,7 @@ const path = require('path');
 const http = require('http');
 const socketIo = require('socket.io');
 require('dotenv').config();
+const { findFaqAnswer, MAWA_FAQ_UNAVAILABLE_MESSAGE } = require('./mawa_faq');
 
 // ===== HASHAGE DE MOT DE PASSE (bcrypt avec migration SHA-256 / texte clair) =====
 async function hashPassword(password) {
@@ -459,14 +460,67 @@ function cleanupMawaNotificationRequests() {
     }
   }
 }
+
+// Envoie la notification FCM « MAWA a une réponse » si une demande en attente correspond.
+async function notifyPendingMawaReply(userId, requestId) {
+  cleanupMawaNotificationRequests();
+  if (!requestId) return;
+  const pending = mawaNotificationRequests.get(requestId);
+  if (!pending || String(pending.userId) !== userId || pending.processed) return;
+  if (Date.now() - pending.createdAt > MAWA_NOTIF_TTL_MS) return;
+
+  const users = readJSONFile(USERS_FILE);
+  const user = users.find((u) => String(u.id) === userId);
+  const token = user && user.fcmToken;
+  if (!token || typeof token !== 'string' || token.trim() === '') {
+    mawaNotificationRequests.delete(requestId);
+    return;
+  }
+
+  pending.attempts = (pending.attempts || 0) + 1;
+  try {
+    const ok = await sendFcmToToken(token.trim(), {
+      title: 'MAWA a une réponse pour vous',
+      body: '🤖 MAWA a une réponse pour vous.',
+      type: 'mawa_reply',
+      data: { requestId },
+    });
+    if (ok) {
+      pending.processed = true;
+      mawaNotificationRequests.delete(requestId);
+    } else if (pending.attempts >= MAWA_NOTIF_MAX_ATTEMPTS) {
+      mawaNotificationRequests.delete(requestId);
+    }
+  } catch (e) {
+    if (pending.attempts >= MAWA_NOTIF_MAX_ATTEMPTS) mawaNotificationRequests.delete(requestId);
+  }
+}
+// Masque la clé API Gemini dans les journaux (node-fetch inclut l'URL complète
+// dans ses messages d'erreur, et certains corps d'erreur Gemini recopient la clé).
+function sanitizeMawaLog(text) {
+  if (!text) return '';
+  return String(text).replace(/([?&]key=)[^&\s"']+/gi, '$1***');
+}
+
 // ===== MAWA assistant endpoint =====
 app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
+  // Déclarés au niveau du handler : le bloc catch doit pouvoir les utiliser.
+  const message = (req.body && typeof req.body.message === 'string') ? req.body.message.trim() : '';
+  const requestId = (req.body && typeof req.body.requestId === 'string') ? req.body.requestId.trim() : '';
+
+  // Repli quand Gemini est indisponible (clé absente, erreur HTTP, panne réseau,
+  // délai dépassé) : correspondance FAQ élargie si elle est pertinente, sinon
+  // message d'indisponibilité clair. Format conservé : { reply: "..." }.
+  const sendUnavailableOrFaq = () => {
+    if (res.headersSent) return;
+    const softHit = findFaqAnswer(message, { loose: true });
+    return res.json({ reply: softHit ? softHit.reply : MAWA_FAQ_UNAVAILABLE_MESSAGE });
+  };
+
   try {
-    const message = (req.body && typeof req.body.message === 'string') ? req.body.message.trim() : '';
     if (!message) return res.status(400).json({ error: 'Message requis' });
     if (message.length > 2000) return res.status(400).json({ error: 'Message trop long (max 2000 caracteres)' });
 
-    const requestId = (req.body && typeof req.body.requestId === 'string') ? req.body.requestId.trim() : '';
     const userId = String(req.user.id);
     const now = Date.now();
     const windowMs = 60 * 1000;
@@ -477,73 +531,68 @@ app.post('/api/mawa/chat', authenticateToken, async (req, res) => {
     mawaRateLimits.set(userId, entry);
     if (entry.count > maxReq) return res.status(429).json({ error: 'Trop de requetes, reessayez plus tard' });
 
+    // FAQ MAWA : les questions fréquentes reçoivent une réponse prédéfinie
+    // sans appeler Gemini. Le format de réponse reste { reply: "..." }.
+    const faqHit = findFaqAnswer(message);
+    if (faqHit) {
+      await notifyPendingMawaReply(userId, requestId);
+      if (res.headersSent) return;
+      return res.json({ reply: faqHit.reply });
+    }
+
+    // NOTE : sendUnavailableOrFaq est désormais défini au niveau du handler
+    // (ligne ci-dessus) afin d'être accessible aussi bien depuis le bloc try
+    // que depuis le bloc catch. Son comportement est inchangé.
+
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return res.status(503).json({ error: 'Service indisponible' });
+    if (!apiKey) return sendUnavailableOrFaq();
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
 
     const systemPrompt = "Tu es MAWA, l'assistant officiel de DJASSACI. Reponds en francais simple. Tu ne reponds qu'aux questions concernant DJASSACI : produits, categories, vendeurs, boutiques, certification, commandes, paiements GeniusPay, comptes, connexion et utilisation de l'application. Pour toute question hors sujet, reponds poliment que MAWA est specialisee dans DJASSACI. Ne jamais inventer de donnees, de prix, de statuts de commande ou d'informations privees. Oriente vers le support humain si necessaire.";
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: message }] }],
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let response;
+    try {
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: message }] }],
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          generationConfig: { maxOutputTokens: 500, temperature: 0.7 },
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      // Le délai est annulé même si fetch échoue (panne réseau ou abandon).
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error('Gemini error:', response.status, errText);
-      if (response.status === 429) return res.status(429).json({ error: 'Service temporairement limite' });
-      return res.status(502).json({ error: 'Erreur du service d\'assistant' });
+      console.error('Gemini error:', response.status, sanitizeMawaLog(errText));
+      return sendUnavailableOrFaq();
     }
 
     const data = await response.json();
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Desole, je n'ai pas pu repondre.";
 
     // Notification MAWA si une demande en attente correspond
-    cleanupMawaNotificationRequests();
-    if (requestId) {
-      const pending = mawaNotificationRequests.get(requestId);
-      if (pending && String(pending.userId) === userId && !pending.processed && Date.now() - pending.createdAt <= MAWA_NOTIF_TTL_MS) {
-        const users = readJSONFile(USERS_FILE);
-        const user = users.find((u) => String(u.id) === userId);
-        const token = user && user.fcmToken;
-        if (token && typeof token === 'string' && token.trim() !== '') {
-          pending.attempts = (pending.attempts || 0) + 1;
-          try {
-            const ok = await sendFcmToToken(token.trim(), {
-              title: 'MAWA a une réponse pour vous',
-              body: '🤖 MAWA a une réponse pour vous.',
-              type: 'mawa_reply',
-              data: { requestId },
-            });
-            if (ok) {
-              pending.processed = true;
-              mawaNotificationRequests.delete(requestId);
-            } else if (pending.attempts >= MAWA_NOTIF_MAX_ATTEMPTS) {
-              mawaNotificationRequests.delete(requestId);
-            }
-          } catch (e) {
-            if (pending.attempts >= MAWA_NOTIF_MAX_ATTEMPTS) mawaNotificationRequests.delete(requestId);
-          }
-        } else {
-          mawaNotificationRequests.delete(requestId);
-        }
-      }
-    }
-
+    await notifyPendingMawaReply(userId, requestId);
+    if (res.headersSent) return;
     return res.json({ reply });
   } catch (error) {
-    if (error && error.name === 'AbortError') return res.status(504).json({ error: 'Delai depasse' });
-    console.error('MAWA error:', error && error.message ? error.message : error);
-    return res.status(500).json({ error: 'Erreur serveur' });
+    // Panne réseau, délai dépassé (AbortError) ou erreur inattendue :
+    // on renvoie le repli FAQ / indisponibilité, sans renvoyer une 2e réponse.
+    const isTimeout = Boolean(error && (error.name === 'AbortError' || error.type === 'aborted'));
+    console.error(
+      'MAWA error:',
+      isTimeout
+        ? 'delai depasse (30s)'
+        : sanitizeMawaLog(error && error.message ? error.message : error)
+    );
+    return sendUnavailableOrFaq();
   }
 });
 
