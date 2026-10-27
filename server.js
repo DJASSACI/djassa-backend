@@ -169,6 +169,7 @@ async function sendFcmToUsers(users, { title, body, type, data = {} }) {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 const io = socketIo(server, { cors: { origin: '*' } });
 
@@ -248,6 +249,8 @@ const ORDERS_FILE = path.join(JSON_STORAGE_DIR, 'orders.json');
 const ARTICLES_FILE = path.join(JSON_STORAGE_DIR, 'articles.json');
 const SUBSCRIPTIONS_FILE = path.join(JSON_STORAGE_DIR, 'subscriptions.json');
 const CERTIFICATION_INFO_FILE = path.join(JSON_STORAGE_DIR, 'certification_info.json');
+const WEBHOOK_EVENTS_FILE = path.join(JSON_STORAGE_DIR, 'webhook_events.json');
+const ADMIN_AUDIT_LOG_FILE = path.join(JSON_STORAGE_DIR, 'admin_audit_log.json');
 const PROMOTIONS_FILE = path.join(JSON_STORAGE_DIR, 'promotions.json');
 const PASSWORD_RESULTS_FILE = path.join(JSON_STORAGE_DIR, 'password_resets.json');
 
@@ -442,11 +445,112 @@ const authenticateToken = (req, res, next) => {
     if (err) {
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
+    // Vérifier l'état actuel du compte (suspension)
+    const users = readJSONFile(USERS_FILE);
+    const dbUser = users.find((u) => u.id === user.id);
+    if (dbUser && dbUser.suspended === true) {
+      return res.status(403).json({ error: 'Compte suspendu' });
+    }
     req.user = user;
     next();
   });
 };
+
+// Middleware centralisé de contrôle d'accès administrateur.
+// Réutilise req.user défini par authenticateToken. Ne modifie pas le JWT.
+const requireAdmin = (req, res, next) => {
+  if (!req.user || req.user.role !== 'admin') {
+    logAdminEvent(req.user && req.user.id, 'admin.access_denied', 'route', req.path, 'denied', req.requestId);
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+};
+
+// Journal administratif
+function readAuditLog() {
+  try {
+    const data = fs.readFileSync(ADMIN_AUDIT_LOG_FILE, 'utf8');
+    const parsed = JSON.parse(data);
+    if (parsed && Array.isArray(parsed.events)) {
+      auditLogCorrupted = false;
+      return parsed;
+    }
+    auditLogCorrupted = true;
+    console.error('Audit log corrupted: invalid structure');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') {
+      auditLogCorrupted = false;
+      return { version: 1, events: [] };
+    }
+    auditLogCorrupted = true;
+    console.error('Audit log read error:', e && e.message ? e.message : e);
+  }
+  return { version: 1, events: [] };
+}
+
+function pruneAuditLog(events) {
+  const cutoff = Date.now() - 365 * 24 * 60 * 60 * 1000;
+  return events.filter((e) => {
+    const ts = new Date(e.timestamp).getTime();
+    return !Number.isNaN(ts) && ts >= cutoff;
+  });
+}
+
+function writeAuditLog(events) {
+  if (auditLogCorrupted) {
+    console.error('Audit log write blocked: file corrupted');
+    return;
+  }
+  const pruned = pruneAuditLog(events);
+  const tmp = ADMIN_AUDIT_LOG_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify({ version: 1, events: pruned }, null, 2), 'utf8');
+  fs.renameSync(tmp, ADMIN_AUDIT_LOG_FILE);
+}
+
+function logAdminEvent(actorId, action, targetType, targetId, result, requestId) {
+  if (auditLogCorrupted) {
+    console.error('Audit log event skipped: file corrupted');
+    return;
+  }
+  try {
+    // sérialisation simple en mémoire
+    const run = () => {
+      const log = readAuditLog();
+      const event = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        timestamp: new Date().toISOString(),
+        actorId: actorId || null,
+        action,
+        targetType: targetType || null,
+        targetId: targetId || null,
+        result,
+        requestId: requestId || null,
+      };
+      log.events.push(event);
+      writeAuditLog(log.events);
+    };
+    if (auditLogLock.busy) {
+      // attendre brièvement
+      setTimeout(run, 10);
+    } else {
+      auditLogLock.busy = true;
+      try { run(); } finally { auditLogLock.busy = false; }
+    }
+  } catch (e) {
+    console.error('Audit log write error:', e && e.message ? e.message : e);
+  }
+}
+
+// requestId middleware (léger)
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || null;
+  next();
+});
 const mawaRateLimits = new Map();
+const loginAttempts = new Map();
+const processingKeys = new Set();
+const auditLogLock = { busy: false };
+let auditLogCorrupted = false;
 // Demandes de notification MAWA en attente (en mémoire; perdues au redémarrage).
 const mawaNotificationRequests = new Map();
 const MAWA_NOTIF_TTL_MS = 10 * 60 * 1000;
@@ -683,6 +787,21 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { numero, password } = req.body;
 
+    // Limitation des tentatives de connexion (en mémoire, par IP)
+    const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const windowMs = 15 * 60 * 1000;
+    const maxAttempts = 5;
+    const entry = loginAttempts.get(clientIp) || { count: 0, reset: now + windowMs };
+    if (now > entry.reset) {
+      entry.count = 0;
+      entry.reset = now + windowMs;
+    }
+    if (entry.count >= maxAttempts) {
+      const retryAfter = Math.ceil((entry.reset - now) / 1000);
+      return res.status(429).json({ error: 'Trop de tentatives, réessayez plus tard', retryAfter });
+    }
+
     if (!numero || !password) {
       return res.status(400).json({
         error: 'Phone number and password are required',
@@ -695,14 +814,23 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     if (!user) {
+      const e = loginAttempts.get(clientIp) || { count: 0, reset: Date.now() + 15 * 60 * 1000 };
+      e.count += 1;
+      loginAttempts.set(clientIp, e);
       return res.status(401).json({ error: 'Utilisateur non trouvé' });
     }
 
     const passwordValid = await verifyPassword(password, user.password);
 
     if (!passwordValid) {
+      const e = loginAttempts.get(clientIp) || { count: 0, reset: Date.now() + 15 * 60 * 1000 };
+      e.count += 1;
+      loginAttempts.set(clientIp, e);
       return res.status(401).json({ message: 'Mot de passe incorrect' });
     }
+
+    // Réinitialise le compteur après authentification réussie
+    loginAttempts.delete(clientIp);
 
     // Migration vers bcrypt si le hash stocké n'est pas déjà bcrypt
     if (
@@ -1101,12 +1229,8 @@ app.get('/api/promotions/:id', (req, res) => {
   }
 });
 
-app.post('/api/promotions', authenticateToken, async (req, res) => {
+app.post('/api/promotions', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const {
       name,
       price,
@@ -1168,12 +1292,8 @@ app.post('/api/promotions', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/promotions/:id', authenticateToken, (req, res) => {
+app.put('/api/promotions/:id', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const promotions = readJSONFile(PROMOTIONS_FILE);
     const promotionIndex = promotions.findIndex((p) => p.id === parseInt(req.params.id));
     if (promotionIndex === -1) {
@@ -1227,12 +1347,8 @@ app.put('/api/promotions/:id', authenticateToken, (req, res) => {
   }
 });
 
-app.delete('/api/promotions/:id', authenticateToken, (req, res) => {
+app.delete('/api/promotions/:id', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const promotions = readJSONFile(PROMOTIONS_FILE);
     const promotionIndex = promotions.findIndex((p) => p.id === parseInt(req.params.id));
     if (promotionIndex === -1) {
@@ -1390,22 +1506,45 @@ app.put('/api/products/:id', authenticateToken, (req, res) => {
 });
 
 app.delete('/api/products/:id', authenticateToken, (req, res) => {
-  const products = readJSONFile(PRODUCTS_FILE);
-  const productIndex = products.findIndex((p) => p.id === parseInt(req.params.id));
-  if (productIndex === -1) {
-    return res.status(404).json({ error: 'Product not found' });
+  try {
+    const products = readJSONFile(PRODUCTS_FILE);
+    const productIndex = products.findIndex((p) => p.id === parseInt(req.params.id));
+    if (productIndex === -1) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const product = products[productIndex];
+
+    if (product.vendeur !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    products[productIndex].isActive = false;
+    writeJSONFile(PRODUCTS_FILE, products);
+    res.json({ message: 'Produit supprimé (caché)' });
+  } catch (error) {
+    console.error('Delete product error:', error);
+    res.status(500).json({ error: 'Server error' });
   }
-
-  const product = products[productIndex];
-
-  if (product.vendeur !== req.user.id && req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Not allowed' });
-  }
-
-  products[productIndex].isActive = false;
-  writeJSONFile(PRODUCTS_FILE, products);
-  res.json({ message: 'Produit supprimé (caché)' });
 });
+
+app.put('/api/products/:id/restore', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const products = readJSONFile(PRODUCTS_FILE);
+    const productIndex = products.findIndex((p) => p.id === parseInt(req.params.id));
+    if (productIndex === -1) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    products[productIndex] = { ...products[productIndex], isActive: true };
+    writeJSONFile(PRODUCTS_FILE, products);
+    logAdminEvent(req.user.id, 'admin.product_restored', 'product', req.params.id, 'success', req.requestId);
+    res.json({ message: 'Product restored', product: products[productIndex] });
+  } catch (error) {
+    console.error('Restore product error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
 app.get('/api/products/seller/my', authenticateToken, (req, res) => {
   try {
@@ -1629,12 +1768,8 @@ app.get('/api/orders/:id', authenticateToken, (req, res) => {
   }
 });
 
-app.get('/api/orders', authenticateToken, (req, res) => {
+app.get('/api/orders', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const orders = readJSONFile(ORDERS_FILE);
     res.json(orders);
   } catch (error) {
@@ -1692,12 +1827,8 @@ app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
   }
 });
 
-app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
+app.put('/api/orders/:id/status', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const orders = readJSONFile(ORDERS_FILE);
     const orderIndex = orders.findIndex((o) => o.id === parseInt(req.params.id));
 
@@ -1780,11 +1911,8 @@ function refreshSellerVerifiedStatus(user) {
 
 // Met à jour un champ `sellerVerified` + `sellerVerifiedUntil` dans users.json.
 // Alias admin (pour que le dashboard admin puisse certifier sans changer le Flutter)
-app.put('/api/admin/users/:id/verify-seller', authenticateToken, (req, res) => {
+app.put('/api/admin/users/:id/verify-seller', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
     const { sellerCompte, sellerLocalisation } = req.body || {};
 
     const users = readJSONFile(USERS_FILE);
@@ -1854,6 +1982,53 @@ app.put('/api/admin/users/:id/verify-seller', authenticateToken, (req, res) => {
   }
 });
 
+// Suspension / réactivation de compte (admin uniquement)
+app.put('/api/admin/users/:id/suspend', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user id' });
+    if (req.user.id === userId) {
+      return res.status(403).json({ error: 'Cannot suspend your own account' });
+    }
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === userId);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    if (users[userIndex].role === 'admin') {
+      return res.status(403).json({ error: 'Cannot suspend an admin account' });
+    }
+    const { reason } = req.body || {};
+    users[userIndex] = { ...users[userIndex], suspended: true, suspendedAt: new Date().toISOString(), suspendedReason: reason || null };
+    writeJSONFile(USERS_FILE, users);
+    logAdminEvent(req.user.id, 'admin.user_suspended', 'user', String(userId), 'success', req.requestId);
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'User suspended', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Suspend user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/admin/users/:id/reactivate', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user id' });
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === userId);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    users[userIndex] = { ...users[userIndex], suspended: false, suspendedAt: null, suspendedReason: null };
+    writeJSONFile(USERS_FILE, users);
+    logAdminEvent(req.user.id, 'admin.user_reactivated', 'user', String(userId), 'success', req.requestId);
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'User reactivated', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Reactivate user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
   try {
     const { sellerCompte, sellerLocalisation } = req.body || {};
@@ -2216,12 +2391,8 @@ app.put('/api/users/fcm-token', authenticateToken, (req, res) => {
   }
 });
 
-app.get('/api/users', authenticateToken, (req, res) => {
+app.get('/api/users', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const users = readJSONFile(USERS_FILE);
     const usersWithoutPassword = users.map(({ password, ...user }) => user);
     res.json(usersWithoutPassword);
@@ -2231,12 +2402,8 @@ app.get('/api/users', authenticateToken, (req, res) => {
   }
 });
 
-app.post('/api/admin/certification-info', authenticateToken, (req, res) => {
+app.post('/api/admin/certification-info', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const { boutiqueNom, rectoCiUrl, versoCiUrl, lieu, photoVendeurUrl, telephone } = req.body;
 
     if (!boutiqueNom || !rectoCiUrl || !versoCiUrl || !lieu || !photoVendeurUrl || !telephone) {
@@ -2265,12 +2432,8 @@ app.post('/api/admin/certification-info', authenticateToken, (req, res) => {
   }
 });
 
-app.get('/api/admin/certification-info', authenticateToken, (req, res) => {
+app.get('/api/admin/certification-info', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const data = readJSONFile(CERTIFICATION_INFO_FILE);
     res.json(data);
   } catch (error) {
@@ -2422,12 +2585,8 @@ app.post('/api/contact/seller', (req, res) => {
 });
 
 // STATS
-app.get('/api/stats', authenticateToken, (req, res) => {
+app.get('/api/stats', authenticateToken, requireAdmin, (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
-    }
-
     const users = readJSONFile(USERS_FILE);
     const products = readJSONFile(PRODUCTS_FILE);
     const orders = readJSONFile(ORDERS_FILE);
@@ -2472,102 +2631,152 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   const orderId = metadata.order_id;
   const paymentType = metadata.payment_type; // 'order' | 'seller_certification'
 
-  // 1) Paiements des commandes (flux existant + notifications push)
-  const orders = readJSONFile(ORDERS_FILE);
-  const index = orders.findIndex((o) => o.id == orderId);
+  // Clé de déduplication dérivée (pas d'event_id natif dans le code actuel)
+  const dedupKey = `${event}:${paymentType || 'order'}:${orderId || metadata.user_id || 'unknown'}`;
 
-  if (index !== -1) {
-    const oldStatut = orders[index].statut;
-
-    if (event === 'payment.success') {
-      orders[index].statut = 'payée';
-      io.emit('payment_update', { orderId, status: 'payée' });
-    }
-
-    if (event === 'payment.failed') {
-      orders[index].statut = 'échouée';
-      io.emit('payment_update', { orderId, status: 'échouée' });
-    }
-
-    writeJSONFile(ORDERS_FILE, orders);
-
-    // Notification push à l'acheteur uniquement si le statut a réellement changé.
-    if (orders[index].statut !== oldStatut) {
-      const buyerId = orders[index].utilisateurId;
-      const users = readJSONFile(USERS_FILE);
-      const buyer = users.find((u) => u.id == buyerId);
-
-      if (buyer && buyer.fcmToken) {
-        const orderNumber = orders[index].id;
-        if (event === 'payment.success') {
-          sendFcmToToken(buyer.fcmToken, {
-            title: 'Paiement confirmé',
-            body: `Votre commande #${orderNumber} est payée !`,
-            type: 'payment_confirmed',
-            data: { orderId: String(orders[index].id) },
-          }).catch(() => {}); // non bloquant
-        } else if (event === 'payment.failed') {
-          sendFcmToToken(buyer.fcmToken, {
-            title: 'Paiement échoué',
-            body: `Votre commande #${orderNumber} n'a pas pu être réglée.`,
-            type: 'payment_failed',
-            data: { orderId: String(orders[index].id) },
-          }).catch(() => {}); // non bloquant
-        }
-      }
-    }
+  // Verrou en mémoire (instance unique)
+  if (processingKeys.has(dedupKey)) {
+    return res.sendStatus(200);
   }
 
-  // 2) Paiement certification vendeur (webhook GeniusPay)
-  let certificationNotified = false;
-  if (paymentType === 'seller_certification' && event === 'payment.success') {
-    const certificationUserId = metadata.user_id;
-    if (certificationUserId) {
-      const users = readJSONFile(USERS_FILE);
-      const userIndex = users.findIndex((u) => u.id == certificationUserId);
-      if (userIndex !== -1) {
-        const now = new Date();
-        const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  // Registre persistant
+  const events = readJSONFile(WEBHOOK_EVENTS_FILE);
+  const existing = Array.isArray(events) ? events.find((e) => e.key === dedupKey) : null;
+  if (existing && existing.status === 'processed') {
+    return res.sendStatus(200);
+  }
 
-        const wasAlreadyCertified =
-          users[userIndex].sellerVerified === true &&
-          users[userIndex].sellerVerifiedUntil &&
-          new Date(users[userIndex].sellerVerifiedUntil).getTime() > now.getTime();
+  // Si processing ancien (> 5 min), on autorise la reprise
+  const STALE_MS = 5 * 60 * 1000;
+  if (existing && existing.status === 'processing' && Date.now() - (existing.updatedAt || 0) < STALE_MS) {
+    return res.sendStatus(200);
+  }
 
-        users[userIndex] = {
-          ...users[userIndex],
-          sellerVerified: true,
-          sellerVerifiedAt: now.toISOString(),
-          sellerVerifiedUntil: until.toISOString(),
-          sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
-        };
+  processingKeys.add(dedupKey);
 
-        writeJSONFile(USERS_FILE, users);
+  try {
+    // Marquer processing
+    const idx = events.findIndex((e) => e.key === dedupKey);
+    const record = { key: dedupKey, status: 'processing', updatedAt: Date.now() };
+    if (idx !== -1) events[idx] = record; else events.push(record);
+    writeJSONFile(WEBHOOK_EVENTS_FILE, events);
 
-        // Notifier le vendeur (pas l'admin), éviter les doublons si déjà certifié.
-        if (!wasAlreadyCertified) {
-          const seller = users[userIndex];
-          if (seller && seller.fcmToken) {
-            sendFcmToToken(seller.fcmToken, {
-              title: 'Boutique certifiée',
-              body: 'Votre certification vendeur est activée pour 30 jours.',
-              type: 'seller_certified',
-              data: {
-                userId: String(seller.id),
-                sellerVerifiedUntil: until.toISOString(),
-              },
-            }).catch(() => {}); // non bloquant
-            certificationNotified = true;
+    // 1) Paiements des commandes
+    const orders = readJSONFile(ORDERS_FILE);
+    const index = orders.findIndex((o) => o.id == orderId);
+
+    if (index !== -1) {
+      const oldStatut = orders[index].statut;
+
+      // Idempotence métier : ne pas réappliquer si déjà dans l'état cible
+      if (event === 'payment.success' && orders[index].statut !== 'payée') {
+        orders[index].statut = 'payée';
+        io.emit('payment_update', { orderId, status: 'payée' });
+      }
+      if (event === 'payment.failed' && orders[index].statut !== 'échouée') {
+        orders[index].statut = 'échouée';
+        io.emit('payment_update', { orderId, status: 'échouée' });
+      }
+
+      writeJSONFile(ORDERS_FILE, orders);
+
+      if (orders[index].statut !== oldStatut) {
+        const buyerId = orders[index].utilisateurId;
+        const users = readJSONFile(USERS_FILE);
+        const buyer = users.find((u) => u.id == buyerId);
+
+        if (buyer && buyer.fcmToken) {
+          const orderNumber = orders[index].id;
+          if (event === 'payment.success') {
+            sendFcmToToken(buyer.fcmToken, {
+              title: 'Paiement confirmé',
+              body: `Votre commande #${orderNumber} est payée !`,
+              type: 'payment_confirmed',
+              data: { orderId: String(orders[index].id) },
+            }).catch(() => {});
+          } else if (event === 'payment.failed') {
+            sendFcmToToken(buyer.fcmToken, {
+              title: 'Paiement échoué',
+              body: `Votre commande #${orderNumber} n'a pas pu être réglée.`,
+              type: 'payment_failed',
+              data: { orderId: String(orders[index].id) },
+            }).catch(() => {});
           }
         }
       }
     }
-  }
 
-  res.sendStatus(200);
+    // 2) Paiement certification vendeur
+    if (paymentType === 'seller_certification' && event === 'payment.success') {
+      const certificationUserId = metadata.user_id;
+      if (certificationUserId) {
+        const users = readJSONFile(USERS_FILE);
+        const userIndex = users.findIndex((u) => u.id == certificationUserId);
+        if (userIndex !== -1) {
+          const now = new Date();
+          const alreadyActive =
+            users[userIndex].sellerVerified === true &&
+            users[userIndex].sellerVerifiedUntil &&
+            new Date(users[userIndex].sellerVerifiedUntil).getTime() > now.getTime();
+
+          if (!alreadyActive) {
+            const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+            users[userIndex] = {
+              ...users[userIndex],
+              sellerVerified: true,
+              sellerVerifiedAt: now.toISOString(),
+              sellerVerifiedUntil: until.toISOString(),
+              sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+            };
+            writeJSONFile(USERS_FILE, users);
+
+            const seller = users[userIndex];
+            if (seller && seller.fcmToken) {
+              sendFcmToToken(seller.fcmToken, {
+                title: 'Boutique certifiée',
+                body: 'Votre certification vendeur est activée pour 30 jours.',
+                type: 'seller_certified',
+                data: {
+                  userId: String(seller.id),
+                  sellerVerifiedUntil: until.toISOString(),
+                },
+              }).catch(() => {});
+            }
+          }
+        }
+      }
+    }
+
+    // Marquer processed uniquement après succès
+    const finalEvents = readJSONFile(WEBHOOK_EVENTS_FILE);
+    const fi = finalEvents.findIndex((e) => e.key === dedupKey);
+    const finalRecord = { key: dedupKey, status: 'processed', updatedAt: Date.now() };
+    if (fi !== -1) finalEvents[fi] = finalRecord; else finalEvents.push(finalRecord);
+    writeJSONFile(WEBHOOK_EVENTS_FILE, finalEvents);
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('Webhook processing error:', err && err.message ? err.message : err);
+    res.sendStatus(500);
+  } finally {
+    processingKeys.delete(dedupKey);
+  }
 });
 
 // START EXTRA ROUTES
+app.get('/api/admin/audit-log', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const log = readAuditLog();
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+    const events = log.events.slice().sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const page = events.slice(offset, offset + limit);
+    res.json({ version: log.version, total: events.length, limit, offset, events: page });
+  } catch (error) {
+    console.error('Audit log read error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 app.put('/api/orders/:id/pay-vendor', authenticateToken, (req, res) => {
   const orderId = parseInt(req.params.id);
   const orders = readJSONFile(ORDERS_FILE);

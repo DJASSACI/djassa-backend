@@ -1,35 +1,227 @@
-// Backend Server for Djassa CI - E-commerce Platform
-// Author: Djassa CI Team
-
+// Backend Server for Djassa CI - E-commerce Platform // Author: Djassa CI Team
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const socketIo = require('socket.io');
 require('dotenv').config();
 
+const GENIUSPAY_API_KEY = process.env.GENIUSPAY_API_KEY;
+const GENIUSPAY_SECRET_KEY = process.env.GENIUSPAY_SECRET_KEY;
+const fetch = require('node-fetch');
+
+const chatRoutes = require('./routes/chatRoutes');
+
+const admin = require('firebase-admin');
+let firebaseAdminReady = false;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(
+        JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+      ),
+    });
+    firebaseAdminReady = true;
+    console.log('✅ Firebase Admin initialisé');
+  } catch (e) {
+    console.error('❌ Échec initialisation Firebase Admin:', e.message);
+  }
+} else {
+  console.error('❌ FIREBASE_SERVICE_ACCOUNT manquant, notifications FCM désactivées');
+}
+
+function isFirebaseAdminInitialized() {
+  return firebaseAdminReady && admin.apps && admin.apps.length > 0;
+}
+
+// Normalise toutes les valeurs de data en chaînes (contrainte FCM).
+function fcmData(data) {
+  const out = {};
+  for (const [k, v] of Object.entries(data || {})) {
+    out[k] = v === undefined || v === null ? '' : String(v);
+  }
+  return out;
+}
+
+// Envoie une notification FCM à un jeton unique (non bloquant, ne révèle pas le jeton).
+async function sendFcmToToken(fcmToken, { title, body, type, data = {} }) {
+  if (!isFirebaseAdminInitialized()) {
+    console.error('FCM non envoyé: Firebase Admin non initialisé');
+    return false;
+  }
+  if (!fcmToken || typeof fcmToken !== 'string' || fcmToken.trim() === '') {
+    console.error('FCM non envoyé: jeton manquant ou invalide');
+    return false;
+  }
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: { title, body },
+      data: { type, ...fcmData(data) },
+    });
+    return true;
+  } catch (e) {
+    console.error('Erreur envoi FCM (jeton):', e.message || e);
+    return false;
+  }
+}
+
+// Envoie une notification FCM à un topic (non bloquant).
+async function sendFcmToTopic(topic, { title, body, type, data = {} }) {
+  if (!isFirebaseAdminInitialized()) {
+    console.error(`FCM topic ${topic} non envoyé: Firebase Admin non initialisé`);
+    return false;
+  }
+  if (!topic || typeof topic !== 'string') {
+    console.error('FCM topic non envoyé: topic manquant');
+    return false;
+  }
+  try {
+    await admin.messaging().send({
+      topic,
+      notification: { title, body },
+      data: { type, ...fcmData(data) },
+    });
+    return true;
+  } catch (e) {
+    console.error(`Erreur envoi FCM (topic ${topic}):`, e.message || e);
+    return false;
+  }
+}
+
+// Envoie une notification à plusieurs utilisateurs dédupliqués par jeton (non bloquant par destinataire).
+// users: tableau d'objets { id, fcmToken }. Ignore les doublons de jeton et les utilisateurs sans jeton valide.
+async function sendFcmToUsers(users, { title, body, type, data = {} }) {
+  if (!isFirebaseAdminInitialized()) {
+    console.error('FCM users non envoyé: Firebase Admin non initialisé');
+    return { sent: 0, skipped: 0, errors: 0 };
+  }
+  if (!Array.isArray(users) || users.length === 0) {
+    return { sent: 0, skipped: 0, errors: 0 };
+  }
+
+  const seenTokens = new Set();
+  let sent = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const u of users) {
+    if (!u || !u.fcmToken || typeof u.fcmToken !== 'string') {
+      skipped++;
+      continue;
+    }
+    const token = u.fcmToken.trim();
+    if (token === '' || seenTokens.has(token)) {
+      skipped++;
+      continue;
+    }
+    seenTokens.add(token);
+    try {
+      const ok = await sendFcmToToken(token, { title, body, type, data });
+      if (ok) sent++; else errors++;
+    } catch (e) {
+      console.error(`Erreur envoi FCM utilisateur ${u.id}:`, e.message || e);
+      errors++;
+    }
+  }
+
+  console.log(`FCM users: sent=${sent} skipped=${skipped} errors=${errors}`);
+  return { sent, skipped, errors };
+}
+
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, { cors: { origin: '*' } });
+
+io.on('connection', (socket) => {
+  console.log('🟢 Client connecté Socket.IO :', socket.id);
+  socket.on('disconnect', () => {
+    console.log('🔴 Client déconnecté :', socket.id);
+  });
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || 'djassa_ci_secret_key_2024';
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Serve static files (frontend)
+// Multer for uploads images
+const multer = require('multer');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, 'product-' + uniqueSuffix + path.extname(file.originalname));
+  },
+});
+
+// (Upload multer non utilisé dans ce serveur actuellement)
+// const upload = multer({
+//   storage,
+//   limits: { fileSize: 5 * 1024 * 1024 },
+//   fileFilter: (req, file, cb) => {
+//     if (file.mimetype.startsWith('image/')) {
+//       cb(null, true);
+//     } else {
+//       cb(new Error('Seule les images sont autorisées'));
+//     }
+//   },
+// });
+
+
+// Serve static uploads
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 app.get('/', (req, res) => {
   res.send('Djassa CI Backend OK 🚀');
 });
 
-// File paths for JSON storage
-const USERS_FILE = path.join(__dirname, 'users.json');
-const PRODUCTS_FILE = path.join(__dirname, 'products.json');
-const ORDERS_FILE = path.join(__dirname, 'orders.json');
-const ARTICLES_FILE = path.join(__dirname, 'articles.json');
+// File paths for JSON storage (Render Persistent Disk)
+// Render Persistent Disk is mounted at /data (persistent across deployments).
+// Fallback to local __dirname for development.
+const DATA_DIR = process.env.DATA_DIR || '/data';
 
-// Helper functions to read/write JSON files
+const JSON_STORAGE_DIR = (() => {
+  try {
+    if (fs.existsSync(DATA_DIR) && fs.statSync(DATA_DIR).isDirectory()) {
+      return DATA_DIR;
+    }
+  } catch (e) {
+    // ignore
+  }
+  return __dirname;
+})();
+
+const USERS_FILE = path.join(JSON_STORAGE_DIR, 'users.json');
+const PRODUCTS_FILE = path.join(JSON_STORAGE_DIR, 'products.json');
+const ORDERS_FILE = path.join(JSON_STORAGE_DIR, 'orders.json');
+const ARTICLES_FILE = path.join(JSON_STORAGE_DIR, 'articles.json');
+const SUBSCRIPTIONS_FILE = path.join(JSON_STORAGE_DIR, 'subscriptions.json');
+const CERTIFICATION_INFO_FILE = path.join(JSON_STORAGE_DIR, 'certification_info.json');
+const PROMOTIONS_FILE = path.join(JSON_STORAGE_DIR, 'promotions.json');
+const PASSWORD_RESULTS_FILE = path.join(JSON_STORAGE_DIR, 'password_resets.json');
+
+const ensureJSONFilesDir = () => {
+  try {
+    if (JSON_STORAGE_DIR !== __dirname) {
+      fs.mkdirSync(JSON_STORAGE_DIR, { recursive: true });
+    }
+  } catch (e) {
+    console.error('Error ensuring JSON storage dir:', e);
+  }
+};
+
+
 const readJSONFile = (filePath) => {
   try {
     const data = fs.readFileSync(filePath, 'utf8');
@@ -50,114 +242,124 @@ const writeJSONFile = (filePath, data) => {
   }
 };
 
-// Initialize default data if files don't exist
 const initializeData = () => {
+  ensureJSONFilesDir();
   if (!fs.existsSync(PRODUCTS_FILE)) {
     const defaultProducts = [
       {
         id: 1,
-        name: "Téléphone portable",
+        name: 'Téléphone portable',
         price: 50000,
-        image: "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Smartphone dernière génération avec caméra haute résolution",
-        categorie: "Téléphones",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description:
+          'Smartphone dernière génération avec caméra haute résolution',
+        categorie: 'Téléphones',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 2,
-        name: "Ordinateur portable",
+        name: 'Ordinateur portable',
         price: 300000,
-        image: "https://images.unsplash.com/photo-1496181133206-80ce9b88a853?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Ordinateur portable performant pour le travail et les jeux",
-        categorie: "Ordinateurs",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1496181133206-80ce9b88a853?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description:
+          'Ordinateur portable performant pour le travail et les jeux',
+        categorie: 'Ordinateurs',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 3,
-        name: "Casque audio",
+        name: 'Casque audio',
         price: 15000,
-        image: "https://images.unsplash.com/photo-1484704849700-f032a568e944?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Casque sans fil avec réduction de bruit active",
-        categorie: "Audio",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1484704849700-f032a568e944?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description: 'Casque sans fil avec réduction de bruit active',
+        categorie: 'Audio',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 4,
-        name: "Chargeur USB",
+        name: 'Chargeur USB',
         price: 5000,
-        image: "https://images.unsplash.com/photo-1586953208448-b95a79798f07?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Chargeur rapide compatible avec tous les appareils",
-        categorie: "Accessoires",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1586953208448-b95a79798f07?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description: 'Chargeur rapide compatible avec tous les appareils',
+        categorie: 'Accessoires',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 5,
-        name: "Tablette",
+        name: 'Tablette',
         price: 80000,
-        image: "https://images.unsplash.com/photo-1544244015-0df4b3ffc6b0?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Tablette tactile légère et puissante",
-        categorie: "Tablettes",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1544244015-0df4b3ffc6b0?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description: 'Tablette tactile légère et puissante',
+        categorie: 'Tablettes',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 6,
-        name: "Smartwatch",
+        name: 'Smartwatch',
         price: 25000,
-        image: "https://images.unsplash.com/photo-1523275335684-37898b6baf30?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Montre connectée avec suivi de santé",
-        categorie: "Montres",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1523275335684-37898b6baf30?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description: 'Montre connectée avec suivi de santé',
+        categorie: 'Montres',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 7,
-        name: "Télévision LED",
+        name: 'Télévision LED',
         price: 150000,
-        image: "https://images.unsplash.com/photo-1593359677879-a4bb92f829d1?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Télévision LED 4K avec Smart TV",
-        categorie: "TV",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1593359677879-a4bb92f829d1?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description: 'Télévision LED 4K avec Smart TV',
+        categorie: 'TV',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
+        isActive: true,
       },
       {
         id: 8,
-        name: "Mixeur électrique",
+        name: 'Mixeur électrique',
         price: 20000,
-        image: "https://images.unsplash.com/photo-1571019613454-1cb2f99b2d8b?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80",
-        description: "Mixeur puissant avec plusieurs vitesses",
-        categorie: "Électroménager",
-        vendeur: "Admin",
-        vendeurCompte: "",
-        vendeurLocalisation: "Abidjan",
+        image:
+          'https://images.unsplash.com/photo-1571019613454-1cb2f99b2d8b?ixlib=rb-4.0.3&auto=format&fit=crop&w=500&q=80',
+        description: 'Mixeur puissant avec plusieurs vitesses',
+        categorie: 'Électroménager',
+        vendeur: 'Admin',
+        vendeurCompte: '',
+        vendeurLocalisation: 'Abidjan',
         datePublication: new Date().toISOString(),
-        isActive: true
-      }
+        isActive: true,
+      },
     ];
     writeJSONFile(PRODUCTS_FILE, defaultProducts);
   }
@@ -165,19 +367,29 @@ const initializeData = () => {
   if (!fs.existsSync(USERS_FILE)) {
     writeJSONFile(USERS_FILE, []);
   }
-
   if (!fs.existsSync(ORDERS_FILE)) {
     writeJSONFile(ORDERS_FILE, []);
+  }
+  if (!fs.existsSync(SUBSCRIPTIONS_FILE)) {
+    writeJSONFile(SUBSCRIPTIONS_FILE, []);
+  }
+  if (!fs.existsSync(CERTIFICATION_INFO_FILE)) {
+    writeJSONFile(CERTIFICATION_INFO_FILE, []);
+  }
+  if (!fs.existsSync(PROMOTIONS_FILE)) {
+    writeJSONFile(PROMOTIONS_FILE, []);
+  }
+  if (!fs.existsSync(PASSWORD_RESULTS_FILE)) {
+    writeJSONFile(PASSWORD_RESULTS_FILE, []);
   }
 };
 
 initializeData();
 
-// ==================== AUTHENTICATION MIDDLEWARE ====================
+// AUTH middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-
   if (!token) {
     return res.status(401).json({ error: 'Access token required' });
   }
@@ -191,35 +403,32 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ==================== AUTH ROUTES ====================
-
-// Register new user
+// AUTH ROUTES
 app.post('/api/auth/register', (req, res) => {
   try {
     const { nom, prenom, numero, address, password } = req.body;
 
-    // Validation
     if (!nom || !prenom || !numero || !address || !password) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-
     if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      return res
+        .status(400)
+        .json({ error: 'Password must be at least 6 characters' });
     }
 
     const users = readJSONFile(USERS_FILE);
-
-    // Check if user already exists
-    const existingUser = users.find(u => u.numero === numero);
+    const existingUser = users.find((u) => u.numero === numero);
     if (existingUser) {
-      return res.status(400).json({ error: 'User with this phone number already exists' });
+      return res.status(400).json({
+        error: 'Ce numéro de téléphone est déjà associé à un compte DJASSACI. Connectez-vous à votre compte ou utilisez un autre numéro.',
+      });
     }
 
-    // Create new user (in production, hash the password!)
     const hashedPassword = crypto
-      .createHash("sha256")
+      .createHash('sha256')
       .update(password)
-      .digest("hex");
+      .digest('hex');
 
     const newUser = {
       id: Date.now(),
@@ -227,32 +436,26 @@ app.post('/api/auth/register', (req, res) => {
       prenom,
       numero,
       address,
-      password: hashedPassword, // In production: await bcrypt.hash(password, 10)
+      password: hashedPassword,
       role: 'user',
-      dateInscription: new Date().toISOString()
+      dateInscription: new Date().toISOString(),
     };
 
     users.push(newUser);
     writeJSONFile(USERS_FILE, users);
 
-    // Generate token
     const token = jwt.sign(
-      {
-        id: newUser.id,
-        numero: newUser.numero,
-        role: newUser.role
-      },
+      { id: newUser.id, numero: newUser.numero, role: newUser.role },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    // Remove password from response
     const { password: _, ...userWithoutPassword } = newUser;
 
     res.status(201).json({
       message: 'Registration successful',
       token,
-      user: userWithoutPassword
+      user: userWithoutPassword,
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -260,29 +463,34 @@ app.post('/api/auth/register', (req, res) => {
   }
 });
 
-// Login
 app.post('/api/auth/login', (req, res) => {
   try {
     const { numero, password } = req.body;
 
     if (!numero || !password) {
-      return res.status(400).json({ error: 'Phone number and password are required' });
+      return res.status(400).json({
+        error: 'Phone number and password are required',
+      });
     }
 
     const users = readJSONFile(USERS_FILE);
-
-    // Find user by numero (flexible matching - phone or email)
-    const user = users.find(u => u.numero === numero || u.numero.toLowerCase() === numero.toLowerCase());
+    const user = users.find(
+      (u) => u.numero === numero || u.numero.toLowerCase() === numero.toLowerCase()
+    );
 
     if (!user) {
       return res.status(401).json({ error: 'Utilisateur non trouvé' });
     }
 
-    const hashedPassword = crypto.createHash("sha256").update(password).digest("hex");
+    const hashedPassword = crypto
+      .createHash('sha256')
+      .update(password)
+      .digest('hex');
+
     const passwordValid = user.password === password || user.password === hashedPassword;
 
     if (!passwordValid) {
-      return res.status(401).json({ message: "Mot de passe incorrect" });
+      return res.status(401).json({ message: 'Mot de passe incorrect' });
     }
 
     if (user.password === password) {
@@ -290,24 +498,21 @@ app.post('/api/auth/login', (req, res) => {
       writeJSONFile(USERS_FILE, users);
     }
 
-    // Generate token
     const token = jwt.sign(
-      {
-        id: user.id,
-        numero: user.numero,
-        role: user.role
-      },
+      { id: user.id, numero: user.numero, role: user.role },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    // Remove password from response
     const { password: _, ...userWithoutPassword } = user;
 
     res.json({
       message: 'Login successful',
       token,
-      user: userWithoutPassword
+      user: {
+        ...userWithoutPassword,
+        mustChangePassword: user.mustChangePassword === true,
+      },
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -315,12 +520,10 @@ app.post('/api/auth/login', (req, res) => {
   }
 });
 
-// Get current user
 app.get('/api/auth/me', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.id === req.user.id);
-
+    const user = users.find((u) => u.id === req.user.id);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -333,23 +536,16 @@ app.get('/api/auth/me', authenticateToken, (req, res) => {
   }
 });
 
-// Refresh token - Generate a new token without requiring login
 app.post('/api/auth/refresh', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.id === req.user.id);
-
+    const user = users.find((u) => u.id === req.user.id);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Generate new token with fresh expiration
     const token = jwt.sign(
-      {
-        id: user.id,
-        numero: user.numero,
-        role: user.role
-      },
+      { id: user.id, numero: user.numero, role: user.role },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -361,30 +557,284 @@ app.post('/api/auth/refresh', authenticateToken, (req, res) => {
   }
 });
 
-// ==================== PRODUCTS ROUTES ====================
+// ===== CHANGEMENT DE MOT DE PASSE (profil) =====
+app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
 
-// Get all products
+    const user = users[userIndex];
+    const { oldPassword, newPassword, confirmPassword } = req.body;
+
+    if (!oldPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'Tous les champs sont requis' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'Les deux nouveaux mots de passe ne correspondent pas. Vérifiez votre saisie et réessayez.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères' });
+    }
+
+    const hashedOldPassword = crypto
+      .createHash('sha256')
+      .update(oldPassword)
+      .digest('hex');
+
+    const oldPasswordValid = user.password === oldPassword || user.password === hashedOldPassword;
+
+    if (!oldPasswordValid) {
+      return res.status(401).json({ error: 'Votre ancien mot de passe est incorrect. Vérifiez votre saisie et réessayez.' });
+    }
+
+    const hashedNewPassword = crypto
+      .createHash('sha256')
+      .update(newPassword)
+      .digest('hex');
+
+    users[userIndex] = {
+      ...users[userIndex],
+      password: hashedNewPassword,
+      mustChangePassword: false,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({
+      message: 'Votre mot de passe a été modifié avec succès.',
+      user: userWithoutPassword,
+    });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Server error during password change' });
+  }
+});
+
+// ===== MOT DE PASSE OUBLIÉ =====
+// Demande de réinitialisation (statut pending, aucun mot de passe stocké).
+app.post('/api/auth/forgot-password/request', (req, res) => {
+  try {
+    const { numero } = req.body;
+
+    if (!numero || String(numero).trim() === '') {
+      return res.status(400).json({ error: 'Le numéro de téléphone est requis' });
+    }
+
+    const users = readJSONFile(USERS_FILE);
+    const user = users.find(
+      (u) => u.numero === numero || u.numero.toLowerCase() === numero.toLowerCase()
+    );
+
+    if (!user) {
+      return res.status(400).json({
+        error: 'Aucun compte DJASSACI n\'est associé à ce numéro de téléphone. Vérifiez votre numéro et réessayez.',
+      });
+    }
+
+    const resets = readJSONFile(PASSWORD_RESULTS_FILE);
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 heure
+
+    resets.push({
+      id: Date.now(),
+      numero: user.numero,
+      userId: user.id,
+      token,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      expiresAt,
+    });
+
+    writeJSONFile(PASSWORD_RESULTS_FILE, resets);
+
+    res.json({
+      message: 'Demande de réinitialisation créée. Une vérification est requise via WhatsApp.',
+    });
+  } catch (error) {
+    console.error('Forgot password request error:', error);
+    res.status(500).json({ error: 'Server error during password reset request' });
+  }
+});
+
+// Validation manuelle par l'administrateur après vérification WhatsApp.
+app.post('/api/auth/forgot-password/approve', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const { numero, tempPassword } = req.body;
+
+    if (!numero || !tempPassword || tempPassword.length < 6) {
+      return res.status(400).json({
+        error: 'Numéro et mot de passe temporaire (6 caractères minimum) requis',
+      });
+    }
+
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex(
+      (u) => u.numero === numero || u.numero.toLowerCase() === numero.toLowerCase()
+    );
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+
+    const resets = readJSONFile(PASSWORD_RESULTS_FILE);
+    const resetIndex = resets.findIndex(
+      (r) =>
+        String(r.userId) === String(users[userIndex].id) &&
+        r.status === 'pending' &&
+        new Date(r.expiresAt).getTime() > Date.now()
+    );
+    if (resetIndex === -1) {
+      return res.status(400).json({ error: 'Aucune demande de réinitialisation en attente' });
+    }
+
+    const hashedTempPassword = crypto
+      .createHash('sha256')
+      .update(tempPassword)
+      .digest('hex');
+
+    users[userIndex] = {
+      ...users[userIndex],
+      password: hashedTempPassword,
+      mustChangePassword: true,
+    };
+
+    resets[resetIndex] = {
+      ...resets[resetIndex],
+      status: 'approved',
+      approvedAt: new Date().toISOString(),
+      approvedBy: req.user.id,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+    writeJSONFile(PASSWORD_RESULTS_FILE, resets);
+
+    res.json({
+      message: 'Demande validée. Mot de passe temporaire défini.',
+    });
+  } catch (error) {
+    console.error('Forgot password approve error:', error);
+    res.status(500).json({ error: 'Server error during password reset approval' });
+  }
+});
+
+// Réinitialisation du mot de passe après connexion avec le mot de passe temporaire.
+app.post('/api/auth/forgot-password/reset', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+
+    const user = users[userIndex];
+
+    if (user.mustChangePassword !== true) {
+      return res.status(400).json({ error: 'Aucune réinitialisation de mot de passe requise' });
+    }
+
+    const { tempPassword, newPassword, confirmPassword } = req.body;
+
+    if (!tempPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'Tous les champs sont requis' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'Les mots de passe ne correspondent pas' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères' });
+    }
+
+    const hashedTempPassword = crypto
+      .createHash('sha256')
+      .update(tempPassword)
+      .digest('hex');
+
+    if (user.password !== hashedTempPassword) {
+      return res.status(401).json({ error: 'Mot de passe temporaire incorrect' });
+    }
+
+    const hashedNewPassword = crypto
+      .createHash('sha256')
+      .update(newPassword)
+      .digest('hex');
+
+    users[userIndex] = {
+      ...users[userIndex],
+      password: hashedNewPassword,
+      mustChangePassword: false,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    res.json({ message: 'Mot de passe mis à jour avec succès' });
+  } catch (error) {
+    console.error('Forgot password reset error:', error);
+    res.status(500).json({ error: 'Server error during password reset' });
+  }
+});
+
+// ===== FIN MOT DE PASSE OUBLIÉ =====
+
+// PRODUCTS
 app.get('/api/products', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
-    const activeProducts = products.filter(p => p.isActive !== false);
-    res.json(activeProducts);
+    const activeProducts = products.filter((p) => p.isActive !== false);
+
+    const users = readJSONFile(USERS_FILE);
+    const enhanced = activeProducts.map((p) => {
+      const vendeurId = p.vendeur;
+      const vendeurUser = users.find((u) => u.id == vendeurId);
+
+      // Forcer la valeur persistée `sellerVerified` à être cohérente avec `sellerVerifiedUntil`
+      // (sinon le frontend peut voir temporairement false après verify-seller).
+      if (vendeurUser) {
+        refreshSellerVerifiedStatus(vendeurUser);
+      }
+
+      return {
+        ...p,
+        // côté Flutter on attend `product.vendeur` comme un objet
+        vendeur: {
+          ...(typeof p.vendeur === 'object' && p.vendeur != null ? p.vendeur : {}),
+          id: vendeurUser?.id,
+          nom: vendeurUser?.nom,
+          prenom: vendeurUser?.prenom,
+          numero: vendeurUser?.numero,
+          address: vendeurUser?.address,
+          sellerVerified: vendeurUser?.sellerVerified === true,
+          sellerVerifiedAt: vendeurUser?.sellerVerifiedAt ?? null,
+          // Alias pour compatibilité (certains écrans lisent seller_verified)
+          seller_verified: vendeurUser?.sellerVerified === true,
+        },
+      };
+    });
+
+    res.json(enhanced);
   } catch (error) {
     console.error('Get products error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Get product by ID
 app.get('/api/products/:id', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
-    const product = products.find(p => p.id === parseInt(req.params.id));
-
+    const product = products.find((p) => p.id === parseInt(req.params.id));
     if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
-
     res.json(product);
   } catch (error) {
     console.error('Get product error:', error);
@@ -392,14 +842,14 @@ app.get('/api/products/:id', (req, res) => {
   }
 });
 
-// Get products by category
 app.get('/api/products/category/:category', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
     const categoryProducts = products.filter(
-      p => p.categorie.toLowerCase() === req.params.category.toLowerCase() && p.isActive !== false
+      (p) =>
+        p.categorie.toLowerCase() === req.params.category.toLowerCase() &&
+        p.isActive !== false
     );
-
     res.json(categoryProducts);
   } catch (error) {
     console.error('Get products by category error:', error);
@@ -407,19 +857,17 @@ app.get('/api/products/category/:category', (req, res) => {
   }
 });
 
-// Search products
 app.get('/api/products/search/:query', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
     const query = req.params.query.toLowerCase();
-    const searchResults = products.filter(p => (p.isActive !== false) &&
-      (
-        p.name.toLowerCase().includes(query) ||
-        p.description.toLowerCase().includes(query) ||
-        p.categorie.toLowerCase().includes(query)
-      )
+    const searchResults = products.filter(
+      (p) =>
+        p.isActive !== false &&
+        (p.name.toLowerCase().includes(query) ||
+          p.description.toLowerCase().includes(query) ||
+          p.categorie.toLowerCase().includes(query))
     );
-
     res.json(searchResults);
   } catch (error) {
     console.error('Search products error:', error);
@@ -427,18 +875,207 @@ app.get('/api/products/search/:query', (req, res) => {
   }
 });
 
-// Create product (seller)
-app.post('/api/products', authenticateToken, (req, res) => {
+// PROMOTIONS ENDPOINTS
+app.get('/api/promotions', (req, res) => {
   try {
-    const { name, price, image, description, categorie, vendeurCompte, vendeurLocalisation } = req.body;
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const activePromotions = promotions.filter((p) => p.isActive !== false);
+    res.json(activePromotions);
+  } catch (error) {
+    console.error('Get promotions error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/promotions/:id', (req, res) => {
+  try {
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotion = promotions.find((p) => p.id === parseInt(req.params.id));
+    if (!promotion) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+    res.json(promotion);
+  } catch (error) {
+    console.error('Get promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/promotions', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const {
+      name,
+      price,
+      description,
+      categorie,
+      discountPercent,
+      image,
+      images,
+    } = req.body;
+
+    const imageUrl = image || 'https://via.placeholder.com/400x400?text=Promotion';
+    const imagesList = Array.isArray(images) ? images : [];
+
+    if (!name || !price || !description || !categorie || discountPercent === undefined) {
+      return res.status(400).json({
+        error: 'Name, price, description, category, and discountPercent are required',
+      });
+    }
+
+    const discount = parseInt(discountPercent);
+    if (isNaN(discount) || discount < 1 || discount > 100) {
+      return res.status(400).json({ error: 'discountPercent must be between 1 and 100' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+
+    const newPromotion = {
+      id: Date.now(),
+      name,
+      price: parseFloat(price),
+      description,
+      categorie,
+      discountPercent: discount,
+      discountedPrice: parseFloat(price) * (1 - discount / 100),
+      image: imageUrl,
+      images: imagesList,
+      datePublication: new Date().toISOString(),
+      isActive: true,
+    };
+
+    promotions.push(newPromotion);
+    writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    // Notification promotionnelle au topic global (après enregistrement effectif).
+    sendFcmToTopic('djassaci_all', {
+      title: 'Nouvelle promotion',
+      body: name,
+      type: 'promotion',
+      data: {
+        promotionId: String(newPromotion.id),
+        promotionName: name,
+      },
+    }).catch(() => {}); // non bloquant
+
+    res.status(201).json({ message: 'Promotion created successfully', promotion: newPromotion });
+  } catch (error) {
+    console.error('Create promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/promotions/:id', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotionIndex = promotions.findIndex((p) => p.id === parseInt(req.params.id));
+    if (promotionIndex === -1) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+
+    const promotion = promotions[promotionIndex];
+
+    const {
+      name,
+      price,
+      image,
+      images,
+      description,
+      categorie,
+      discountPercent,
+      isActive,
+    } = req.body;
+
+    const imagesList = Array.isArray(images)
+      ? images
+      : (promotion.images || []);
+
+    const updateData = {
+      ...promotion,
+      name: name || promotion.name,
+      price: price ? parseFloat(price) : promotion.price,
+      image: image || promotion.image,
+      images: imagesList,
+      description: description || promotion.description,
+      categorie: categorie || promotion.categorie,
+      isActive: isActive !== undefined ? isActive : promotion.isActive,
+    };
+
+    if (discountPercent !== undefined) {
+      const discount = parseInt(discountPercent);
+      if (isNaN(discount) || discount < 1 || discount > 100) {
+        return res.status(400).json({ error: 'discountPercent must be between 1 and 100' });
+      }
+      updateData.discountPercent = discount;
+      updateData.discountedPrice = updateData.price * (1 - discount / 100);
+    }
+
+    promotions[promotionIndex] = updateData;
+    writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    res.json({ message: 'Promotion updated successfully', promotion: updateData });
+  } catch (error) {
+    console.error('Update promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/promotions/:id', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotionIndex = promotions.findIndex((p) => p.id === parseInt(req.params.id));
+    if (promotionIndex === -1) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+
+    promotions.splice(promotionIndex, 1);
+    writeJSONFile(PROMOTIONS_FILE, promotions);
+
+    res.json({ message: 'Promotion deleted successfully' });
+  } catch (error) {
+    console.error('Delete promotion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/products', authenticateToken, async (req, res) => {
+  try {
+    const {
+      name,
+      price,
+      description,
+      categorie,
+      vendeurCompte,
+      vendeurLocalisation,
+      paymentMethod,
+      paymentAccount,
+      image,
+      images,
+      videoUrl,
+    } = req.body;
+
+    const imageUrl = image || 'https://via.placeholder.com/400x400?text=Product';
+    const imagesList = Array.isArray(images) ? images : [];
 
     if (!name || !price || !description || !categorie) {
-      return res.status(400).json({ error: 'Name, price, description, and category are required' });
+      return res.status(400).json({
+        error: 'Name, price, description, and category are required',
+      });
     }
 
     const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.id === req.user.id);
-
+    const user = users.find((u) => u.id === req.user.id);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -449,7 +1086,8 @@ app.post('/api/products', authenticateToken, (req, res) => {
       id: Date.now(),
       name,
       price: parseFloat(price),
-      image: image || 'https://via.placeholder.com/400x400?text=Product',
+      image: imageUrl,
+      images: imagesList,
       description,
       categorie,
       vendeur: req.user.id,
@@ -457,11 +1095,41 @@ app.post('/api/products', authenticateToken, (req, res) => {
       vendeurCompte: vendeurCompte || '',
       vendeurLocalisation: vendeurLocalisation || user.address,
       datePublication: new Date().toISOString(),
-      isActive: true
+      isActive: true,
+      videoUrl: videoUrl || null,
     };
 
     products.push(newProduct);
     writeJSONFile(PRODUCTS_FILE, products);
+
+    // Notifier les abonnés du vendeur (nouveau produit), excluant le vendeur lui-même.
+    const sellerId = String(req.user.id);
+    const sellerShopName = user.boutiqueNom || `${user.prenom} ${user.nom}` || 'Boutique';
+    try {
+      const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+      const followerEntries = subscriptions.filter(
+        (s) => s && String(s.followingId) === sellerId
+      );
+      // Dédupliquer les followerId (un même utilisateur ne suit qu'une fois, mais on sécurise).
+      const uniqueFollowerIds = [...new Set(followerEntries.map((s) => String(s.followerId)))];
+      const followerUsers = users.filter(
+        (u) => u && uniqueFollowerIds.includes(String(u.id)) && String(u.id) !== sellerId
+      );
+
+      if (followerUsers.length > 0) {
+        sendFcmToUsers(followerUsers, {
+          title: `Nouvelle publication de ${sellerShopName}`,
+          body: `${name} vient d'être publié.`,
+          type: 'followed_seller_product',
+          data: {
+            productId: String(newProduct.id),
+            sellerId: sellerId,
+          },
+        }).catch(() => {}); // non bloquant
+      }
+    } catch (e) {
+      console.error('Erreur notification abonnés nouveau produit:', e.message || e);
+    }
 
     res.status(201).json({ message: 'Product created successfully', product: newProduct });
   } catch (error) {
@@ -470,35 +1138,46 @@ app.post('/api/products', authenticateToken, (req, res) => {
   }
 });
 
-// Update product
 app.put('/api/products/:id', authenticateToken, (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
-    const productIndex = products.findIndex(p => p.id === parseInt(req.params.id));
-
+    const productIndex = products.findIndex((p) => p.id === parseInt(req.params.id));
     if (productIndex === -1) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
     const product = products[productIndex];
 
-    // Check if user is the owner or admin
     if (product.vendeur !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'You can only update your own products' });
     }
 
-    const { name, price, image, description, categorie, vendeurCompte, vendeurLocalisation, isActive } = req.body;
+    const {
+      name,
+      price,
+      image,
+      images,
+      description,
+      categorie,
+      vendeurCompte,
+      vendeurLocalisation,
+      isActive,
+    } = req.body;
+
+    const imagesList = Array.isArray(images) ? images : (product.images || []);
 
     products[productIndex] = {
       ...product,
       name: name || product.name,
       price: price ? parseFloat(price) : product.price,
       image: image || product.image,
+      images: imagesList,
       description: description || product.description,
       categorie: categorie || product.categorie,
       vendeurCompte: vendeurCompte !== undefined ? vendeurCompte : product.vendeurCompte,
-      vendeurLocalisation: vendeurLocalisation !== undefined ? vendeurLocalisation : product.vendeurLocalisation,
-      isActive: isActive !== undefined ? isActive : product.isActive
+      vendeurLocalisation:
+        vendeurLocalisation !== undefined ? vendeurLocalisation : product.vendeurLocalisation,
+      isActive: isActive !== undefined ? isActive : product.isActive,
     };
 
     writeJSONFile(PRODUCTS_FILE, products);
@@ -512,8 +1191,7 @@ app.put('/api/products/:id', authenticateToken, (req, res) => {
 
 app.delete('/api/products/:id', authenticateToken, (req, res) => {
   const products = readJSONFile(PRODUCTS_FILE);
-  const productIndex = products.findIndex(p => p.id === parseInt(req.params.id));
-
+  const productIndex = products.findIndex((p) => p.id === parseInt(req.params.id));
   if (productIndex === -1) {
     return res.status(404).json({ error: 'Product not found' });
   }
@@ -525,17 +1203,14 @@ app.delete('/api/products/:id', authenticateToken, (req, res) => {
   }
 
   products[productIndex].isActive = false;
-
   writeJSONFile(PRODUCTS_FILE, products);
-
   res.json({ message: 'Produit supprimé (caché)' });
 });
 
-// Get seller's products
 app.get('/api/products/seller/my', authenticateToken, (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
-    const sellerProducts = products.filter(p => p.vendeur === req.user.id);
+    const sellerProducts = products.filter((p) => p.vendeur === req.user.id);
     res.json(sellerProducts);
   } catch (error) {
     console.error('Get seller products error:', error);
@@ -543,11 +1218,10 @@ app.get('/api/products/seller/my', authenticateToken, (req, res) => {
   }
 });
 
-// Get unique sellers/boutiques
 app.get('/api/sellers', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
-    const sellers = [...new Set(products.map(p => p.vendeurNom))];
+    const sellers = [...new Set(products.map((p) => p.vendeurNom))];
     res.json(sellers);
   } catch (error) {
     console.error('Get sellers error:', error);
@@ -555,12 +1229,11 @@ app.get('/api/sellers', (req, res) => {
   }
 });
 
-// Get products by seller
 app.get('/api/sellers/:name/products', (req, res) => {
   try {
     const products = readJSONFile(PRODUCTS_FILE);
     const sellerProducts = products.filter(
-      p => p.vendeurNom === req.params.name && p.isActive !== false
+      (p) => p.vendeurNom === req.params.name && p.isActive !== false
     );
     res.json(sellerProducts);
   } catch (error) {
@@ -569,24 +1242,20 @@ app.get('/api/sellers/:name/products', (req, res) => {
   }
 });
 
-// ==================== ORDERS ROUTES ====================
-
-// Seller confirm delivery endpoint
-app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
+// ORDERS
+app.put('/api/orders/:id/confirm-delivery', authenticateToken, async (req, res) => {
   try {
     const orders = readJSONFile(ORDERS_FILE);
-    const orderIndex = orders.findIndex(o => o.id === parseInt(req.params.id));
-
+    const orderIndex = orders.findIndex((o) => o.id === parseInt(req.params.id));
     if (orderIndex === -1) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
     const order = orders[orderIndex];
 
-    // Check if seller owns any product in order
-    const ownsOrder = order.articles.some(article => {
+    const ownsOrder = order.articles.some((article) => {
       const products = readJSONFile(PRODUCTS_FILE);
-      const product = products.find(p => p.id === article.product?.id);
+      const product = products.find((p) => p.id === article.product?.id);
       return product && product.vendeur === req.user.id;
     });
 
@@ -594,7 +1263,6 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
       return res.status(403).json({ error: 'You can only confirm delivery for your orders' });
     }
 
-    // Only allow if already 'livree'
     if (order.statut !== 'livree') {
       return res.status(400).json({ error: 'Order must be marked as delivered first' });
     }
@@ -602,32 +1270,31 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
     order.statut = 'livraison_confirmee';
     writeJSONFile(ORDERS_FILE, orders);
 
-    // Send FCM notification to buyer
     const buyerId = order.utilisateurId;
     const users = readJSONFile(USERS_FILE);
-    const buyer = users.find(u => u.id == buyerId);
+    const buyer = users.find((u) => u.id == buyerId);
 
     if (buyer && buyer.fcmToken) {
-      const adminFormData = new FormData();
-      adminFormData.append('to', buyer.fcmToken);
-      adminFormData.append('notification', JSON.stringify({
-        title: 'Livraison Confirmée!',
-        body: `Votre commande #${order.id} a été livrée avec succès.`,
-      }));
-      adminFormData.append('data', JSON.stringify({
-        type: 'order_confirmed',
-        orderId: order.id
-      }));
+      await admin.messaging().send({
+        token: buyer.fcmToken,
+        notification: {
+          title: 'Livraison Confirmée',
+          body: `Votre commande #${order.id} est livrée`,
+        },
+        data: {
+          type: 'order_confirmed',
+          orderId: String(order.id),
+        },
+      });
 
-      // Note: Configure FCM server key in backend for real sends
-      console.log(`FCM sent to buyer ${buyer.numero}: Livraison confirmée pour #${order.id}`);
+      console.log('Notification envoyée ✔');
     } else {
       console.log('No FCM token for buyer, skipping notification');
     }
 
     res.json({
       message: 'Livraison confirmée! Notification envoyée à l\'acheteur.',
-      order: order
+      order,
     });
   } catch (error) {
     console.error('Confirm delivery error:', error);
@@ -635,7 +1302,6 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, (req, res) => {
   }
 });
 
-// Create order - Backend source of truth: lookup products, set seller
 app.post('/api/orders', authenticateToken, (req, res) => {
   try {
     const { items, paymentMethod, phoneNumber, accountName, nomLivraison, telLivraison, villeCommune, quartier } = req.body;
@@ -649,33 +1315,53 @@ app.post('/api/orders', authenticateToken, (req, res) => {
     }
 
     const products = readJSONFile(PRODUCTS_FILE);
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const users = readJSONFile(USERS_FILE);
 
-    // Validate/lookup each item, extract seller from products (source of truth)
-    const validatedItems = items.map(item => {
-      const product = products.find(p => p.id === item.id);
+    // Find an admin user to use as seller for promotions (admin-created)
+    const adminUser = users.find((u) => u.role === 'admin');
+
+    const validatedItems = items.map((item) => {
+      // First try to find in products
+      let product = products.find((p) => p.id === item.id);
+      let isPromotion = false;
+
+      // If not found in products, try promotions
+      if (!product) {
+        product = promotions.find((p) => p.id === item.id);
+        isPromotion = true;
+      }
+
       if (!product || !product.isActive) {
         throw new Error(`Product ID ${item.id} not found or inactive`);
       }
+
+      // For promotions, use discountedPrice; for products, use price
+      const itemPrice = isPromotion ? product.discountedPrice : product.price;
+
+      // For promotions, use admin as seller; for products, use product's vendeur
+      const seller = isPromotion ? (adminUser?.id || product.vendeur) : product.vendeur;
+
       return {
         ...item,
-        seller: product.vendeur, // Backend authoritative seller ID
+        price: itemPrice,
+        seller,
         name: product.name,
         image: product.image,
         categorie: product.categorie,
-        vendeurNom: product.vendeurNom,
-        vendeurCompte: product.vendeurCompte
+        vendeurNom: isPromotion ? 'Djassa CI' : product.vendeurNom,
+        vendeurCompte: isPromotion ? '' : product.vendeurCompte,
       };
     });
 
-    const primarySeller = validatedItems[0].seller; // Main seller for order
+    const primarySeller = validatedItems[0].seller;
+    const subtotal = validatedItems.reduce((sum, item) => sum + item.price * item.quantite, 0);
 
-    const subtotal = validatedItems.reduce((sum, item) => sum + (item.price * item.quantite), 0);
     const commissionRate = 0.05;
     const commission = subtotal * commissionRate;
     const total = subtotal + commission;
 
     const orders = readJSONFile(ORDERS_FILE);
-    console.log('🆕 Creating order - userId:', req.user.id, 'primarySeller:', primarySeller);
 
     const newOrder = {
       id: Date.now(),
@@ -695,7 +1381,7 @@ app.post('/api/orders', authenticateToken, (req, res) => {
       villeCommune: villeCommune || null,
       quartier: quartier || null,
       buyerLat: parseFloat(req.body.buyerLat) || null,
-      buyerLng: parseFloat(req.body.buyerLng) || null
+      buyerLng: parseFloat(req.body.buyerLng) || null,
     };
 
     orders.push(newOrder);
@@ -704,7 +1390,7 @@ app.post('/api/orders', authenticateToken, (req, res) => {
     res.status(201).json({
       message: 'Order placed successfully',
       order: newOrder,
-      commission: commission
+      commission,
     });
   } catch (error) {
     console.error('Create order error:', error);
@@ -712,20 +1398,11 @@ app.post('/api/orders', authenticateToken, (req, res) => {
   }
 });
 
-// Get user's orders
 app.get('/api/orders/my', authenticateToken, (req, res) => {
-  console.log('🔍 /api/orders/my - req.user.id:', req.user.id, 'type:', typeof req.user.id);
   try {
     const orders = readJSONFile(ORDERS_FILE);
-    console.log('📊 /api/orders/my - Total orders:', orders.length, 'User ID:', req.user.id);
-
-    const userOrders = orders.filter(o => {
-      const match = o.utilisateurId === req.user.id;
-      if (match) console.log('✅ Filtered order ID:', o.id, 'utilisateurId:', o.utilisateurId);
-      return match;
-    });
-
-    console.log('📊 /api/orders/my - Filtered count:', userOrders.length);
+    const currentUserId = parseInt(req.user.id);
+    const userOrders = orders.filter((o) => parseInt(o.utilisateurId) === currentUserId);
     res.json(userOrders);
   } catch (error) {
     console.error('Get orders error:', error);
@@ -733,17 +1410,14 @@ app.get('/api/orders/my', authenticateToken, (req, res) => {
   }
 });
 
-// Get order by ID
 app.get('/api/orders/:id', authenticateToken, (req, res) => {
   try {
     const orders = readJSONFile(ORDERS_FILE);
-    const order = orders.find(o => o.id === parseInt(req.params.id));
-
+    const order = orders.find((o) => o.id === parseInt(req.params.id));
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Check if user owns the order or is admin
     if (order.utilisateurId !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -755,10 +1429,12 @@ app.get('/api/orders/:id', authenticateToken, (req, res) => {
   }
 });
 
-// Get all orders (admin)
 app.get('/api/orders', authenticateToken, (req, res) => {
   try {
-    // Allow all authenticated users (sellers filter frontend)
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
     const orders = readJSONFile(ORDERS_FILE);
     res.json(orders);
   } catch (error) {
@@ -767,44 +1443,48 @@ app.get('/api/orders', authenticateToken, (req, res) => {
   }
 });
 
-// Get seller orders - Uses new order.seller + legacy fallback
 app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
-  const sellerId = req.params.sellerId;
-  console.log('🔍 /api/orders/seller - sellerId:', sellerId, 'type:', typeof sellerId, 'req.user.id:', req.user.id);
+  const sellerId = parseInt(req.params.sellerId);
+  const currentUserId = parseInt(req.user.id);
+
+  if (currentUserId !== sellerId && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Vous ne pouvez voir que vos propres commandes' });
+  }
 
   try {
-    const sellerId = req.params.sellerId;
-    console.log("SELLER PARAM:", sellerId);
-
     const orders = readJSONFile(ORDERS_FILE);
     const products = readJSONFile(PRODUCTS_FILE);
 
-    // Filter: new order.seller OR legacy articles.vendeur (backward compat)
-    console.log('📊 /api/orders/seller - Total orders:', orders.length);
+    const sellerOrders = orders
+      .map((order) => {
+        const sellerArticles = order.articles.filter((article) => {
+          const articleSeller = parseInt(article.seller || article.vendeur || -1);
+          if (articleSeller === sellerId) {
+            return true;
+          }
 
-    const sellerOrders = orders.filter(order => {
-      const sellerMatch = order.seller === parseInt(sellerId);
-      const articleMatch = order.articles.some(article => {
-        // 1. Direct seller field on article (new orders)
-        if (String(article.seller || article.vendeur || '').trim() === String(sellerId).trim()) {
-          return true;
-        }
-        // 2. Lookup product in catalog to find owner (legacy orders without article.seller)
-        const product = products.find(p => p.id === (article.product?.id || article.id));
-        if (product && product.vendeur === parseInt(sellerId)) {
-          return true;
-        }
-        return false;
-      });
+          const product = products.find((p) => p.id === (article.product?.id || article.id));
+          if (product && parseInt(product.vendeur) === sellerId) {
+            return true;
+          }
+          return false;
+        });
 
-      const match = sellerMatch || articleMatch;
-      if (match) {
-        console.log('✅ Seller filtered order:', order.id, '- seller:', order.seller, 'sellerId:', sellerId);
-      }
-      return match;
-    });
+        if (sellerArticles.length === 0) return null;
 
-    console.log('📊 /api/orders/seller - Filtered count:', sellerOrders.length);
+        const sellerSubtotal = sellerArticles.reduce(
+          (sum, item) => sum + item.price * (item.quantite || 1),
+          0
+        );
+
+        const commissionRate = 0.05;
+        const sellerCommission = sellerSubtotal * commissionRate;
+        const sellerTotal = sellerSubtotal + sellerCommission;
+
+        return { ...order, articles: sellerArticles, sellerTotal };
+      })
+      .filter(Boolean);
+
     res.json(sellerOrders);
   } catch (error) {
     console.error('Get seller orders error:', error);
@@ -812,15 +1492,14 @@ app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
   }
 });
 
-
-
+app.put('/api/orders/:id/status', authenticateToken, (req, res) => {
   try {
     if (req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Admin access required' });
     }
 
     const orders = readJSONFile(ORDERS_FILE);
-    const orderIndex = orders.findIndex(o => o.id === parseInt(req.params.id));
+    const orderIndex = orders.findIndex((o) => o.id === parseInt(req.params.id));
 
     if (orderIndex === -1) {
       return res.status(404).json({ error: 'Order not found' });
@@ -828,8 +1507,8 @@ app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
 
     const { statut } = req.body;
     orders[orderIndex].statut = statut;
-    writeJSONFile(ORDERS_FILE, orders);
 
+    writeJSONFile(ORDERS_FILE, orders);
     res.json({ message: 'Order status updated', order: orders[orderIndex] });
   } catch (error) {
     console.error('Update order status error:', error);
@@ -837,14 +1516,424 @@ app.get('/api/orders/seller/:sellerId', authenticateToken, (req, res) => {
   }
 });
 
-// ==================== USERS ROUTES ====================
+app.put('/api/orders/:id/delivery-info', authenticateToken, (req, res) => {
+  try {
+    const orders = readJSONFile(ORDERS_FILE);
+    const orderIndex = orders.findIndex((o) => o.id === parseInt(req.params.id));
+    if (orderIndex === -1) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
 
-// Get user profile
+    const order = orders[orderIndex];
+
+    if (order.utilisateurId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    const { nomLivraison, telLivraison, villeCommune, quartier, buyerLat, buyerLng } = req.body;
+
+    if (nomLivraison !== undefined && nomLivraison !== '') order.nomLivraison = nomLivraison;
+    if (telLivraison !== undefined && telLivraison !== '') order.telLivraison = telLivraison;
+    if (villeCommune !== undefined && villeCommune !== '') order.villeCommune = villeCommune;
+    if (quartier !== undefined && quartier !== '') order.quartier = quartier;
+    if (buyerLat !== undefined && buyerLat !== null && buyerLat !== '') order.buyerLat = parseFloat(buyerLat);
+    if (buyerLng !== undefined && buyerLng !== null && buyerLng !== '') order.buyerLng = parseFloat(buyerLng);
+
+    writeJSONFile(ORDERS_FILE, orders);
+    res.json({ message: 'Infos livraison mises à jour', order });
+  } catch (error) {
+    console.error('Update delivery info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// CHAT ROUTES
+app.use('/api/messages', authenticateToken, chatRoutes);
+
+// USERS
+
+// Certification seller (monthly subscription 1000 FCFA, one-shot)
+// NOTE: Paiement GeniusPay n'est pas automatiquement intégré côté certificat.
+// On simule l'activation mensuelle: sellerVerifiedUntil = now + 30 jours.
+// Si la date est expirée, sellerVerified sera automatiquement remise à false lors du prochain check.
+
+const MONTHLY_SUBSCRIPTION_FCFA = 1000;
+
+function isSellerSubscriptionActive(user) {
+  const until = user?.sellerVerifiedUntil;
+  if (!until) return false;
+  const untilDate = new Date(until);
+  if (Number.isNaN(untilDate.getTime())) return false;
+  return untilDate.getTime() > Date.now();
+}
+
+function refreshSellerVerifiedStatus(user) {
+  const active = isSellerSubscriptionActive(user);
+  user.sellerVerified = active;
+  if (active && !user.sellerVerifiedAt) {
+    user.sellerVerifiedAt = new Date().toISOString();
+  }
+  if (!active) {
+    user.sellerVerifiedAt = user.sellerVerifiedAt ?? null;
+  }
+}
+
+// Met à jour un champ `sellerVerified` + `sellerVerifiedUntil` dans users.json.
+// Alias admin (pour que le dashboard admin puisse certifier sans changer le Flutter)
+app.put('/api/admin/users/:id/verify-seller', authenticateToken, (req, res) => {
+  try {
+    const { sellerCompte, sellerLocalisation } = req.body || {};
+
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => String(u.id) === String(req.params.id));
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const now = new Date();
+
+    const currentUntil = users[userIndex]?.sellerVerifiedUntil;
+    const currentUntilDate = currentUntil ? new Date(currentUntil) : null;
+
+    let baseDate = now;
+    if (currentUntilDate && !Number.isNaN(currentUntilDate.getTime())) {
+      // Si l'abonnement n'est pas expiré, on étend depuis sellerVerifiedUntil
+      if (currentUntilDate.getTime() > now.getTime()) {
+        baseDate = currentUntilDate;
+      }
+    }
+
+    const until = new Date(baseDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    users[userIndex] = {
+      ...users[userIndex],
+      sellerVerified: true,
+      sellerVerifiedAt: users[userIndex].sellerVerifiedAt ?? now.toISOString(),
+      sellerVerifiedUntil: until.toISOString(),
+      sellerCompte: sellerCompte ?? users[userIndex].sellerCompte ?? '',
+      sellerLocalisation:
+        sellerLocalisation ??
+        users[userIndex].sellerLocalisation ??
+        users[userIndex].address ??
+        '',
+      sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    // Notification de certification au vendeur (pas à l'admin), anti-doublon si déjà certifié.
+    const nowForNotifAdmin = new Date();
+    const wasAlreadyCertifiedAdmin =
+      users[userIndex].sellerVerified === true &&
+      users[userIndex].sellerVerifiedUntil &&
+      new Date(users[userIndex].sellerVerifiedUntil).getTime() > nowForNotifAdmin.getTime();
+
+    if (!wasAlreadyCertifiedAdmin) {
+      const sellerAdmin = users[userIndex];
+      if (sellerAdmin && sellerAdmin.fcmToken) {
+        sendFcmToToken(sellerAdmin.fcmToken, {
+          title: 'Boutique certifiée',
+          body: 'Votre certification vendeur est activée pour 30 jours.',
+          type: 'seller_certified',
+          data: {
+            userId: String(sellerAdmin.id),
+            sellerVerifiedUntil: until.toISOString(),
+          },
+        }).catch(() => {}); // non bloquant
+      }
+    }
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Seller verified successfully (30 days)', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Verify seller (admin alias) error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/users/verify-seller', authenticateToken, (req, res) => {
+  try {
+    const { sellerCompte, sellerLocalisation } = req.body || {};
+
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const now = new Date();
+
+    // Renouvellement 30 jours (recharge à chaque certification)
+    // => si l'utilisateur est déjà certifié, on prolonge à partir de la date actuelle d'expiration
+    const currentUntil = users[userIndex]?.sellerVerifiedUntil;
+    const currentUntilDate = currentUntil ? new Date(currentUntil) : null;
+
+    let baseDate = now;
+    if (currentUntilDate && !Number.isNaN(currentUntilDate.getTime())) {
+      // Si l'abonnement n'est pas expiré, on étend depuis sellerVerifiedUntil
+      if (currentUntilDate.getTime() > now.getTime()) {
+        baseDate = currentUntilDate;
+      }
+    }
+
+    const until = new Date(baseDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    users[userIndex] = {
+      ...users[userIndex],
+      sellerVerified: true,
+      // sellerVerifiedAt: on ne remplace pas la date initiale de certification
+      sellerVerifiedAt: users[userIndex].sellerVerifiedAt ?? now.toISOString(),
+      // sellerVerifiedUntil: mise à jour à chaque renouvellement
+      sellerVerifiedUntil: until.toISOString(),
+      // champs optionnels (pour garder trace du compte saisi)
+      sellerCompte: sellerCompte ?? users[userIndex].sellerCompte ?? '',
+      sellerLocalisation:
+        sellerLocalisation ??
+        users[userIndex].sellerLocalisation ??
+        users[userIndex].address ??
+        '',
+      // trace info abonnement
+      sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+    };
+
+    writeJSONFile(USERS_FILE, users);
+
+    // Notification de certification au vendeur (lui-même), anti-doublon si déjà certifié.
+    const nowForNotifUser = new Date();
+    const wasAlreadyCertifiedUser =
+      users[userIndex].sellerVerified === true &&
+      users[userIndex].sellerVerifiedUntil &&
+      new Date(users[userIndex].sellerVerifiedUntil).getTime() > nowForNotifUser.getTime();
+
+    if (!wasAlreadyCertifiedUser) {
+      const sellerUser = users[userIndex];
+      if (sellerUser && sellerUser.fcmToken) {
+        sendFcmToToken(sellerUser.fcmToken, {
+          title: 'Boutique certifiée',
+          body: 'Votre certification vendeur est activée pour 30 jours.',
+          type: 'seller_certified',
+          data: {
+            userId: String(sellerUser.id),
+            sellerVerifiedUntil: until.toISOString(),
+          },
+        }).catch(() => {}); // non bloquant
+      }
+    }
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Seller verified successfully (30 days)', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Verify seller error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Endpoint: vérifier et mettre à jour sellerVerified selon sellerVerifiedUntil.
+app.post('/api/users/refresh-seller-verified', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = users[userIndex];
+    refreshSellerVerifiedStatus(user);
+
+    users[userIndex] = user;
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Seller verification refreshed', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Refresh seller verified error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/users/:userId/follow', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const targetUser = users.find((user) => String(user.id) === targetId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const isFollowing = subscriptions.some(
+      (subscription) =>
+        String(subscription.followerId) === String(req.user.id) &&
+        String(subscription.followingId) === targetId
+    );
+    const followersCount = subscriptions.filter(
+      (subscription) => String(subscription.followingId) === targetId
+    ).length;
+
+    res.json({ isFollowing, followersCount });
+  } catch (error) {
+    console.error('Get follow status error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/users/:userId/follow', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const followerId = String(req.user.id);
+    if (followerId === targetId) {
+      return res.status(400).json({ error: 'Vous ne pouvez pas vous abonner à vous-même' });
+    }
+
+    const targetUser = users.find((user) => String(user.id) === targetId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const existingSubscription = subscriptions.find(
+      (subscription) =>
+        String(subscription.followerId) === followerId &&
+        String(subscription.followingId) === targetId
+    );
+    if (!existingSubscription) {
+      subscriptions.push({
+        id: Date.now(),
+        followerId: req.user.id,
+        followingId: targetUser.id,
+        createdAt: new Date().toISOString(),
+      });
+      writeJSONFile(SUBSCRIPTIONS_FILE, subscriptions);
+    }
+
+    const followersCount = subscriptions.filter(
+      (subscription) => String(subscription.followingId) === targetId
+    ).length;
+    res.status(existingSubscription ? 200 : 201).json({
+      subscribed: true,
+      isFollowing: true,
+      followersCount,
+    });
+  } catch (error) {
+    console.error('Follow user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/users/:userId/follow', authenticateToken, (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const followerId = String(req.user.id);
+    if (followerId === targetId) {
+      return res.status(400).json({ error: 'Vous ne pouvez pas vous désabonner de vous-même' });
+    }
+
+    const targetUser = users.find((user) => String(user.id) === targetId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const filteredSubscriptions = subscriptions.filter(
+      (subscription) =>
+        !(
+          String(subscription.followerId) === followerId &&
+          String(subscription.followingId) === targetId
+        )
+    );
+    writeJSONFile(SUBSCRIPTIONS_FILE, filteredSubscriptions);
+
+    const followersCount = filteredSubscriptions.filter(
+      (subscription) => String(subscription.followingId) === targetId
+    ).length;
+    res.json({ subscribed: false, isFollowing: false, followersCount });
+  } catch (error) {
+    console.error('Unfollow user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/users/:userId/followers', authenticateToken, (req, res) => {
+  try {
+    const targetId = String(req.params.userId);
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const followerIds = subscriptions
+      .filter((s) => String(s.followingId) === targetId)
+      .map((s) => String(s.followerId));
+    const users = readJSONFile(USERS_FILE).filter((u) => followerIds.includes(String(u.id)));
+    res.json(
+      users.map((u) => ({
+        id: u.id,
+        nom: u.nom,
+        prenom: u.prenom,
+        numero: u.numero,
+        address: u.address,
+        sellerVerified: u.sellerVerified,
+      }))
+    );
+  } catch (error) {
+    console.error('Get followers error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/users/:userId/following', authenticateToken, (req, res) => {
+  try {
+    const targetId = String(req.params.userId);
+    const subscriptions = readJSONFile(SUBSCRIPTIONS_FILE);
+    const followingIds = subscriptions
+      .filter((s) => String(s.followerId) === targetId)
+      .map((s) => String(s.followingId));
+    const users = readJSONFile(USERS_FILE).filter((u) => followingIds.includes(String(u.id)));
+    res.json(
+      users.map((u) => ({
+        id: u.id,
+        nom: u.nom,
+        prenom: u.prenom,
+        numero: u.numero,
+        address: u.address,
+        sellerVerified: u.sellerVerified,
+      }))
+    );
+  } catch (error) {
+    console.error('Get following error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/users/:userId', (req, res) => {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    const targetId = String(req.params.userId);
+    const user = users.find((u) => String(u.id) === targetId);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const publicUser = {
+      id: user.id,
+      nom: user.nom,
+      prenom: user.prenom,
+      avatarUrl: user.avatarUrl || null,
+      sellerVerified: user.sellerVerified || false,
+      sellerVerifiedAt: user.sellerVerifiedAt || null,
+      sellerVerifiedUntil: user.sellerVerifiedUntil || null,
+    };
+
+    res.json(publicUser);
+  } catch (error) {
+    console.error('Get public user error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/users/profile', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.id === req.user.id);
-
+    const user = users.find((u) => u.id === req.user.id);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -857,12 +1946,10 @@ app.get('/api/users/profile', authenticateToken, (req, res) => {
   }
 });
 
-// Update user profile
 app.put('/api/users/profile', authenticateToken, (req, res) => {
   try {
     const users = readJSONFile(USERS_FILE);
-    const userIndex = users.findIndex(u => u.id === req.user.id);
-
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
     if (userIndex === -1) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -873,23 +1960,59 @@ app.put('/api/users/profile', authenticateToken, (req, res) => {
       ...users[userIndex],
       nom: nom || users[userIndex].nom,
       prenom: prenom || users[userIndex].prenom,
-      address: address || users[userIndex].address
+      address: address || users[userIndex].address,
     };
 
     writeJSONFile(USERS_FILE, users);
 
     const { password: _, ...userWithoutPassword } = users[userIndex];
-    res.json({
-      message: 'Profile updated successfully',
-      user: userWithoutPassword
-    });
+    res.json({ message: 'Profile updated successfully', user: userWithoutPassword });
   } catch (error) {
     console.error('Update profile error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Get all users (admin)
+app.put('/api/users/profile/avatar', authenticateToken, (req, res) => {
+  try {
+    const { avatarUrl } = req.body;
+    const users = readJSONFile(USERS_FILE);
+    const userIndex = users.findIndex((u) => u.id === req.user.id);
+    if (userIndex === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    users[userIndex].avatarUrl = avatarUrl;
+    writeJSONFile(USERS_FILE, users);
+
+    const { password: _, ...userWithoutPassword } = users[userIndex];
+    res.json({ message: 'Avatar updated successfully', user: userWithoutPassword });
+  } catch (error) {
+    console.error('Update avatar error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/users/fcm-token', authenticateToken, (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+    const users = readJSONFile(USERS_FILE);
+    const index = users.findIndex((u) => u.id === req.user.id);
+    if (index === -1) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    users[index].fcmToken = fcmToken;
+    console.log('🔥 FCM TOKEN ENREGISTRÉ =', users[index].fcmToken);
+    writeJSONFile(USERS_FILE, users);
+
+    res.json({ message: 'FCM token saved' });
+  } catch (error) {
+    console.error('FCM token save error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/users', authenticateToken, (req, res) => {
   try {
     if (req.user.role !== 'admin') {
@@ -898,7 +2021,6 @@ app.get('/api/users', authenticateToken, (req, res) => {
 
     const users = readJSONFile(USERS_FILE);
     const usersWithoutPassword = users.map(({ password, ...user }) => user);
-
     res.json(usersWithoutPassword);
   } catch (error) {
     console.error('Get users error:', error);
@@ -906,10 +2028,95 @@ app.get('/api/users', authenticateToken, (req, res) => {
   }
 });
 
-// ==================== ARTICLES/BLOG ROUTES ====================
+app.post('/api/admin/certification-info', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
 
-// Get all articles
+    const { boutiqueNom, rectoCiUrl, versoCiUrl, lieu, photoVendeurUrl, telephone } = req.body;
+
+    if (!boutiqueNom || !rectoCiUrl || !versoCiUrl || !lieu || !photoVendeurUrl || !telephone) {
+      return res.status(400).json({ error: 'Tous les champs sont obligatoires' });
+    }
+
+    const newInfo = {
+      id: Date.now(),
+      boutiqueNom,
+      rectoCiUrl,
+      versoCiUrl,
+      lieu,
+      photoVendeurUrl,
+      telephone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const data = readJSONFile(CERTIFICATION_INFO_FILE);
+    data.push(newInfo);
+    writeJSONFile(CERTIFICATION_INFO_FILE, data);
+
+    res.status(201).json({ success: true, data: newInfo });
+  } catch (error) {
+    console.error('Save certification info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/certification-info', authenticateToken, (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const data = readJSONFile(CERTIFICATION_INFO_FILE);
+    res.json(data);
+  } catch (error) {
+    console.error('Get certification info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/users/certify-seller/init', authenticateToken, async (req, res) => {
+  try {
+    const payload = {
+      amount: 1000,
+      description: 'Certification vendeur Djassa CI',
+      customer: {
+        name: req.body.name,
+        phone: req.body.phone || req.user.numero,
+
+      },
+      metadata: {
+        payment_type: 'seller_certification',
+        user_id: String(req.user.id),
+      },
+    };
+
+    const response = await fetch('https://geniuspay.ci/api/v1/merchant/payments', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': GENIUSPAY_API_KEY,
+        'X-API-Secret': GENIUSPAY_SECRET_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+
+    return res.json({
+      success: true,
+      checkout_url: data.data.checkout_url,
+      reference: data.data.reference,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Certification init failed' });
+  }
+});
+
+// ARTICLES
 app.get('/api/articles', (req, res) => {
+
   try {
     const articles = readJSONFile(ARTICLES_FILE);
     res.json(articles);
@@ -919,16 +2126,13 @@ app.get('/api/articles', (req, res) => {
   }
 });
 
-// Get article by ID
 app.get('/api/articles/:id', (req, res) => {
   try {
     const articles = readJSONFile(ARTICLES_FILE);
-    const article = articles.find(a => a.id === parseInt(req.params.id));
-
+    const article = articles.find((a) => a.id === parseInt(req.params.id));
     if (!article) {
       return res.status(404).json({ error: 'Article not found' });
     }
-
     res.json(article);
   } catch (error) {
     console.error('Get article error:', error);
@@ -936,17 +2140,14 @@ app.get('/api/articles/:id', (req, res) => {
   }
 });
 
-// Create new article
 app.post('/api/articles', (req, res) => {
   try {
     const { name, price, image, description, categorie, vendeur, vendeurCompte, vendeurLocalisation } = req.body;
-
     if (!name || !price || !description || !categorie) {
       return res.status(400).json({ error: 'Name, price, description, and category are required' });
     }
 
     const articles = readJSONFile(ARTICLES_FILE);
-
     const newArticle = {
       id: Date.now(),
       name,
@@ -957,7 +2158,7 @@ app.post('/api/articles', (req, res) => {
       vendeur: vendeur || 'Anonymous',
       vendeurCompte: vendeurCompte || '',
       vendeurLocalisation: vendeurLocalisation || '',
-      datePublication: new Date().toISOString()
+      datePublication: new Date().toISOString(),
     };
 
     articles.push(newArticle);
@@ -970,12 +2171,10 @@ app.post('/api/articles', (req, res) => {
   }
 });
 
-// Delete article
 app.delete('/api/articles/:id', (req, res) => {
   try {
     const articles = readJSONFile(ARTICLES_FILE);
-    const articleIndex = articles.findIndex(a => a.id === parseInt(req.params.id));
-
+    const articleIndex = articles.findIndex((a) => a.id === parseInt(req.params.id));
     if (articleIndex === -1) {
       return res.status(404).json({ error: 'Article not found' });
     }
@@ -990,20 +2189,14 @@ app.delete('/api/articles/:id', (req, res) => {
   }
 });
 
-// ==================== CONTACT ROUTES ====================
-
-// Send contact message
+// CONTACT
 app.post('/api/contact', (req, res) => {
   try {
     const { nom, email, sujet, message } = req.body;
-
     if (!nom || !email || !sujet || !message) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-
-    // In production, save to database and/or send email
     console.log('Contact form submission:', { nom, email, sujet, message });
-
     res.json({ message: 'Message sent successfully! We will contact you soon.' });
   } catch (error) {
     console.error('Contact form error:', error);
@@ -1011,18 +2204,13 @@ app.post('/api/contact', (req, res) => {
   }
 });
 
-// Contact seller
 app.post('/api/contact/seller', (req, res) => {
   try {
     const { nomVendeur, numeroVendeur, sujet, message } = req.body;
-
     if (!nomVendeur || !numeroVendeur || !sujet || !message) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-
-    // In production, save to database and/or send SMS/email
     console.log('Seller contact submission:', { nomVendeur, numeroVendeur, sujet, message });
-
     res.json({ message: 'Message sent to seller successfully!' });
   } catch (error) {
     console.error('Seller contact error:', error);
@@ -1030,9 +2218,7 @@ app.post('/api/contact/seller', (req, res) => {
   }
 });
 
-// ==================== STATS ROUTES ====================
-
-// Get dashboard stats (admin)
+// STATS
 app.get('/api/stats', authenticateToken, (req, res) => {
   try {
     if (req.user.role !== 'admin') {
@@ -1046,9 +2232,9 @@ app.get('/api/stats', authenticateToken, (req, res) => {
     const stats = {
       totalUsers: users.length,
       totalProducts: products.length,
-      activeProducts: products.filter(p => p.isActive).length,
+      activeProducts: products.filter((p) => p.isActive).length,
       totalOrders: orders.length,
-      totalRevenue: orders.reduce((sum, o) => sum + o.total, 0)
+      totalRevenue: orders.reduce((sum, o) => sum + o.total, 0),
     };
 
     res.json(stats);
@@ -1058,46 +2244,131 @@ app.get('/api/stats', authenticateToken, (req, res) => {
   }
 });
 
-// ==================== HEALTH CHECK ====================
+// HEALTH CHECK
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'Djassa CI API is running',
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'ok', message: 'Djassa CI API is running', timestamp: new Date().toISOString() });
 });
 
-// CinetPay webhook
-app.post('/notify', (req, res) => {
-  console.log('🔔 CinetPay notification:', req.body);
+app.post('/api/payment/geniuspay/webhook', (req, res) => {
+  const signature = req.headers['x-webhook-signature'];
+  const timestamp = req.headers['x-webhook-timestamp'];
+  const payload = JSON.stringify(req.body);
+  const secret = process.env.GENIUS_WEBHOOK_SECRET;
 
-  const { transaction_id, cpm_trans_status } = req.body;
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(timestamp + '.' + payload)
+    .digest('hex');
 
+  if (signature !== expected) {
+    return res.sendStatus(401);
+  }
+
+  const event = req.body.event;
+  const metadata = req.body.data?.metadata || {};
+  const orderId = metadata.order_id;
+  const paymentType = metadata.payment_type; // 'order' | 'seller_certification'
+
+  // 1) Paiements des commandes (flux existant + notifications push)
   const orders = readJSONFile(ORDERS_FILE);
-  const orderIndex = orders.findIndex(o => o.transaction_id == transaction_id);
+  const index = orders.findIndex((o) => o.id == orderId);
 
-  if (orderIndex === -1) {
-    console.log("❌ Commande non trouvée");
-    return res.send("OK");
+  if (index !== -1) {
+    const oldStatut = orders[index].statut;
+
+    if (event === 'payment.success') {
+      orders[index].statut = 'payée';
+      io.emit('payment_update', { orderId, status: 'payée' });
+    }
+
+    if (event === 'payment.failed') {
+      orders[index].statut = 'échouée';
+      io.emit('payment_update', { orderId, status: 'échouée' });
+    }
+
+    writeJSONFile(ORDERS_FILE, orders);
+
+    // Notification push à l'acheteur uniquement si le statut a réellement changé.
+    if (orders[index].statut !== oldStatut) {
+      const buyerId = orders[index].utilisateurId;
+      const users = readJSONFile(USERS_FILE);
+      const buyer = users.find((u) => u.id == buyerId);
+
+      if (buyer && buyer.fcmToken) {
+        const orderNumber = orders[index].id;
+        if (event === 'payment.success') {
+          sendFcmToToken(buyer.fcmToken, {
+            title: 'Paiement confirmé',
+            body: `Votre commande #${orderNumber} est payée !`,
+            type: 'payment_confirmed',
+            data: { orderId: String(orders[index].id) },
+          }).catch(() => {}); // non bloquant
+        } else if (event === 'payment.failed') {
+          sendFcmToToken(buyer.fcmToken, {
+            title: 'Paiement échoué',
+            body: `Votre commande #${orderNumber} n'a pas pu être réglée.`,
+            type: 'payment_failed',
+            data: { orderId: String(orders[index].id) },
+          }).catch(() => {}); // non bloquant
+        }
+      }
+    }
   }
 
-  if (cpm_trans_status === "ACCEPTED") {
-orders[orderIndex].statut = 'payée';
-    console.log("✅ Paiement confirmé pour commande:", transaction_id);
-  } else {
-    orders[orderIndex].statut = "refusée";
+  // 2) Paiement certification vendeur (webhook GeniusPay)
+  let certificationNotified = false;
+  if (paymentType === 'seller_certification' && event === 'payment.success') {
+    const certificationUserId = metadata.user_id;
+    if (certificationUserId) {
+      const users = readJSONFile(USERS_FILE);
+      const userIndex = users.findIndex((u) => u.id == certificationUserId);
+      if (userIndex !== -1) {
+        const now = new Date();
+        const until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+        const wasAlreadyCertified =
+          users[userIndex].sellerVerified === true &&
+          users[userIndex].sellerVerifiedUntil &&
+          new Date(users[userIndex].sellerVerifiedUntil).getTime() > now.getTime();
+
+        users[userIndex] = {
+          ...users[userIndex],
+          sellerVerified: true,
+          sellerVerifiedAt: now.toISOString(),
+          sellerVerifiedUntil: until.toISOString(),
+          sellerSubscriptionAmountFcfa: MONTHLY_SUBSCRIPTION_FCFA,
+        };
+
+        writeJSONFile(USERS_FILE, users);
+
+        // Notifier le vendeur (pas l'admin), éviter les doublons si déjà certifié.
+        if (!wasAlreadyCertified) {
+          const seller = users[userIndex];
+          if (seller && seller.fcmToken) {
+            sendFcmToToken(seller.fcmToken, {
+              title: 'Boutique certifiée',
+              body: 'Votre certification vendeur est activée pour 30 jours.',
+              type: 'seller_certified',
+              data: {
+                userId: String(seller.id),
+                sellerVerifiedUntil: until.toISOString(),
+              },
+            }).catch(() => {}); // non bloquant
+            certificationNotified = true;
+          }
+        }
+      }
+    }
   }
 
-  writeJSONFile(ORDERS_FILE, orders);
-  res.send("OK");
+  res.sendStatus(200);
 });
 
-// ==================== START SERVER ====================
+// START EXTRA ROUTES
 app.put('/api/orders/:id/pay-vendor', authenticateToken, (req, res) => {
   const orderId = parseInt(req.params.id);
-
   const orders = readJSONFile(ORDERS_FILE);
-  const orderIndex = orders.findIndex(o => o.id === orderId);
+  const orderIndex = orders.findIndex((o) => o.id === orderId);
 
   if (orderIndex === -1) {
     return res.status(404).json({ message: 'Commande non trouvée' });
@@ -1113,7 +2384,7 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
   try {
     const orderId = parseInt(req.params.id);
     const orders = readJSONFile(ORDERS_FILE);
-    const orderIndex = orders.findIndex(o => o.id === orderId);
+    const orderIndex = orders.findIndex((o) => o.id === orderId);
 
     if (orderIndex === -1) {
       return res.status(404).json({ error: 'Commande non trouvée' });
@@ -1121,10 +2392,10 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
 
     const order = orders[orderIndex];
 
-    // Vérifier que le vendeur possède un article de la commande
     const products = readJSONFile(PRODUCTS_FILE);
-    const ownsOrder = order.articles.some(article => {
-      const product = products.find(p => p.id === article.product?.id || p.id === article.id);
+
+    const ownsOrder = order.articles.some((article) => {
+      const product = products.find((p) => p.id === article.product?.id || p.id === article.id);
       return product && product.vendeur === req.user.id;
     });
 
@@ -1132,7 +2403,6 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
       return res.status(403).json({ error: 'Vous ne pouvez livrer que vos propres commandes' });
     }
 
-    // Vérifier que la commande est payée
     if (order.statut !== 'payée') {
       return res.status(400).json({ error: 'La commande doit être payée avant livraison' });
     }
@@ -1147,7 +2417,127 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
+app.post('/api/payment/geniuspay/init', authenticateToken, async (req, res) => {
+  try {
+    const { amount, phone, orderId, name } = req.body;
+
+    const payload = {
+      amount: Number(amount),
+      description: `Commande ${orderId}`,
+      customer: {
+        name: name,
+        phone: phone.startsWith('+') ? phone : `+225${phone}`,
+      },
+      metadata: { order_id: String(orderId) },
+    };
+
+    console.log('👉 GeniusPay payload:', payload);
+
+    const response = await fetch('https://geniuspay.ci/api/v1/merchant/payments', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': GENIUSPAY_API_KEY,
+        'X-API-Secret': GENIUSPAY_SECRET_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+
+    console.log('👉 GeniusPay response:', data);
+
+    if (!response.ok || !data.success) {
+      return res.status(400).json({ success: false, error: data });
+    }
+
+    return res.json({
+      success: true,
+      checkout_url: data.data.checkout_url,
+      reference: data.data.reference,
+    });
+  } catch (error) {
+    console.error('GeniusPay error:', error);
+    res.status(500).json({ error: 'Payment init failed' });
+  }
 });
 
+// ---- Seller certification auto-expiration job (runs periodically) ----
+// Important: this is a lightweight JSON-file update to ensure sellerVerified
+// is automatically set to false after sellerVerifiedUntil expires.
+// Runs every 10 minutes. Envoie aussi un rappel J-1 avant expiration.
+const SELLER_VERIFICATION_CRON_MS = 10 * 60 * 1000;
+const REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000; // ~24h avant expiration
+
+async function autoExpireSellerVerifications() {
+  try {
+    const users = readJSONFile(USERS_FILE);
+    if (!Array.isArray(users) || users.length === 0) return;
+
+    let changed = false;
+    const nowMs = Date.now();
+
+    for (const u of users) {
+      if (!u || !u.sellerVerifiedUntil) continue;
+
+      const untilDate = new Date(u.sellerVerifiedUntil);
+      if (Number.isNaN(untilDate.getTime())) continue;
+
+      const untilMs = untilDate.getTime();
+      const active = untilMs > nowMs;
+
+      // Expiration automatique existante: si certifié et expiré, on désactive.
+      if (u.sellerVerified === true && !active) {
+        u.sellerVerified = false;
+        changed = true;
+      }
+
+      // Rappel J-1: certification active et expirant dans les 24h.
+      if (u.sellerVerified === true && active) {
+        const msUntilExpiry = untilMs - nowMs;
+        const alreadyReminded =
+          u.certReminderSentUntil &&
+          new Date(u.certReminderSentUntil).getTime() >= untilMs;
+
+        if (msUntilExpiry > 0 && msUntilExpiry <= REMINDER_WINDOW_MS && !alreadyReminded) {
+          if (u.fcmToken && typeof u.fcmToken === 'string' && u.fcmToken.trim() !== '') {
+            try {
+              const ok = await sendFcmToToken(u.fcmToken, {
+                title: 'Votre certification expire bientôt',
+                body: 'Votre certification vendeur expire demain. Renouvelez-la pour conserver votre badge.',
+                type: 'certification_expiring_soon',
+                data: {
+                  userId: String(u.id),
+                  sellerVerifiedUntil: u.sellerVerifiedUntil,
+                },
+              });
+              // Marquer comme envoyé uniquement si Firebase a accepté.
+              if (ok) {
+                u.certReminderSentUntil = u.sellerVerifiedUntil;
+                changed = true;
+              }
+            } catch (e) {
+              // Échec d'envoi: on ne marque pas, nouvelle tentative au prochain cycle.
+              console.error(`Rappel certification échoué user ${u.id}:`, e.message || e);
+            }
+          }
+        }
+      }
+    }
+
+    if (changed) {
+      writeJSONFile(USERS_FILE, users);
+      console.log('⏳ Auto-expire/reminder seller verifications (users.json updated)');
+    }
+  } catch (e) {
+    console.error('Auto-expire seller verifications failed:', e);
+  }
+}
+
+// Start immediately and then periodically.
+autoExpireSellerVerifications();
+setInterval(autoExpireSellerVerifications, SELLER_VERIFICATION_CRON_MS);
+
+server.listen(PORT, () => {
+  console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
+});
