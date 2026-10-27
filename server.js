@@ -1521,6 +1521,9 @@ app.delete('/api/products/:id', authenticateToken, (req, res) => {
 
     products[productIndex].isActive = false;
     writeJSONFile(PRODUCTS_FILE, products);
+    if (req.user.role === 'admin') {
+      logAdminEvent(req.user.id, 'admin.product_hidden', 'product', req.params.id, 'success', req.requestId);
+    }
     res.json({ message: 'Produit supprimé (caché)' });
   } catch (error) {
     console.error('Delete product error:', error);
