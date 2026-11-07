@@ -173,10 +173,68 @@ app.set('trust proxy', 1);
 const server = http.createServer(app);
 const io = socketIo(server, { cors: { origin: '*' } });
 
+// F6-D: auth JWT spécifique chat équipe (sans bloquer les connexions historiques/payment_update)
+function getSocketTeamAuthUser(socket) {
+  try {
+    const rawAuth = socket && socket.handshake && socket.handshake.auth ? socket.handshake.auth.token : null;
+    const header = socket && socket.handshake && socket.handshake.headers ? socket.handshake.headers.authorization : null;
+    const headerToken = (typeof header === 'string' && header.startsWith('Bearer ')) ? header.slice(7).trim() : null;
+    const token = (typeof rawAuth === 'string' && rawAuth.trim()) ? rawAuth.trim() : headerToken;
+    if (!token) return { ok: false, error: 'unauthorized' };
+    let user;
+    try { user = jwt.verify(token, JWT_SECRET); } catch (_) { return { ok: false, error: 'unauthorized' }; }
+    if (!user || !user.id) return { ok: false, error: 'unauthorized' };
+    // Suspension (même logique qu'authenticateToken)
+    const users = readJSONFile(USERS_FILE);
+    const dbUser = Array.isArray(users) ? users.find((u) => Number(u.id) === Number(user.id)) : null;
+    if (dbUser && dbUser.suspended === true) return { ok: false, error: 'forbidden' };
+    return { ok: true, user: { id: Number(user.id), role: user.role || null } };
+  } catch (_) { return { ok: false, error: 'unauthorized' }; }
+}
+
+function normalizeTeamSocketId(teamIdInput) {
+  const raw = String(teamIdInput ?? '').trim();
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  return parseInt(raw, 10);
+}
+
+function teamSocketReply(socket, event, payload) {
+  try { socket.emit(event, payload); } catch (_) {}
+}
+
 io.on('connection', (socket) => {
-  console.log('🟢 Client connecté Socket.IO :', socket.id);
+  console.log('Client connecte Socket.IO :', socket.id);
+  // Connexion acceptée pour compat (payment_update / clients historiques). Auth exigée par opération team chat.
+
+  socket.on('join_team', (payload) => {
+    const auth = getSocketTeamAuthUser(socket);
+    if (!auth.ok) return teamSocketReply(socket, 'team_join_error', { ok: false, error: auth.error, message: 'Authentification requise' });
+    const teamId = normalizeTeamSocketId(payload && payload.teamId);
+    if (!teamId) return teamSocketReply(socket, 'team_join_error', { ok: false, error: 'invalid_team_id', message: 'Identifiant équipe invalide' });
+    const team = findTeamById(teamId);
+    if (!team) return teamSocketReply(socket, 'team_join_error', { ok: false, error: 'not_found', message: 'Équipe introuvable' });
+    // Jamais de userId client: identité = token vérifié. Membership réelle obligatoire.
+    if (!isTeamMember(team, auth.user.id)) return teamSocketReply(socket, 'team_join_error', { ok: false, error: 'forbidden', message: 'Accès refusé' });
+    try { socket.join('team:' + teamId); } catch (_) {
+      return teamSocketReply(socket, 'team_join_error', { ok: false, error: 'join_failed', message: 'Impossible de rejoindre le chat' });
+    }
+    return teamSocketReply(socket, 'team_joined', { ok: true, teamId });
+  });
+
+  socket.on('leave_team', (payload) => {
+    const auth = getSocketTeamAuthUser(socket);
+    if (!auth.ok) return teamSocketReply(socket, 'team_leave_error', { ok: false, error: auth.error, message: 'Authentification requise' });
+    const teamId = normalizeTeamSocketId(payload && payload.teamId);
+    if (!teamId) return teamSocketReply(socket, 'team_leave_error', { ok: false, error: 'invalid_team_id', message: 'Identifiant équipe invalide' });
+    // Quitte uniquement la room demandée (pas leaveAll / autres rooms).
+    try { socket.leave('team:' + teamId); } catch (_) {
+      return teamSocketReply(socket, 'team_leave_error', { ok: false, error: 'leave_failed', message: 'Impossible de quitter le chat' });
+    }
+    return teamSocketReply(socket, 'team_left', { ok: true, teamId });
+  });
+
   socket.on('disconnect', () => {
-    console.log('🔴 Client déconnecté :', socket.id);
+    console.log('Client deconnecte :', socket.id);
   });
 });
 
@@ -252,6 +310,9 @@ const CERTIFICATION_INFO_FILE = path.join(JSON_STORAGE_DIR, 'certification_info.
 const WEBHOOK_EVENTS_FILE = path.join(JSON_STORAGE_DIR, 'webhook_events.json');
 const ADMIN_AUDIT_LOG_FILE = path.join(JSON_STORAGE_DIR, 'admin_audit_log.json');
 const PROMOTIONS_FILE = path.join(JSON_STORAGE_DIR, 'promotions.json');
+const TEAM_PURCHASES_FILE = path.join(JSON_STORAGE_DIR, 'team_purchases.json');
+const TEAM_PAYMENTS_FILE = path.join(JSON_STORAGE_DIR, 'team_payments.json');
+const TEAM_MESSAGES_FILE = path.join(JSON_STORAGE_DIR, 'team_messages.json');
 const PASSWORD_RESULTS_FILE = path.join(JSON_STORAGE_DIR, 'password_resets.json');
 
 const ensureJSONFilesDir = () => {
@@ -428,6 +489,15 @@ const initializeData = () => {
   }
   if (!fs.existsSync(PASSWORD_RESULTS_FILE)) {
     writeJSONFile(PASSWORD_RESULTS_FILE, []);
+  }
+  if (!fs.existsSync(TEAM_PURCHASES_FILE)) {
+    writeJSONFile(TEAM_PURCHASES_FILE, []);
+  }
+  if (!fs.existsSync(TEAM_PAYMENTS_FILE)) {
+    writeJSONFile(TEAM_PAYMENTS_FILE, []);
+  }
+  if (!fs.existsSync(TEAM_MESSAGES_FILE)) {
+    writeJSONFile(TEAM_MESSAGES_FILE, []);
   }
 };
 
@@ -2632,10 +2702,21 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   const event = req.body.event;
   const metadata = req.body.data?.metadata || {};
   const orderId = metadata.order_id;
-  const paymentType = metadata.payment_type; // 'order' | 'seller_certification'
+  const paymentType = metadata.payment_type; // 'order' | 'seller_certification' | 'team_contribution'
+  const contributionId = metadata.contribution_id;
+  const webhookReference =
+    (req.body.data && (req.body.data.reference || req.body.data.payment_reference || req.body.data.transaction_reference)) ||
+    req.body.reference ||
+    metadata.reference ||
+    null;
 
   // Clé de déduplication dérivée (pas d'event_id natif dans le code actuel)
-  const dedupKey = `${event}:${paymentType || 'order'}:${orderId || metadata.user_id || 'unknown'}`;
+  let dedupKey;
+  if (paymentType === 'team_contribution') {
+    dedupKey = `${event}:team_contribution:${String(contributionId || 'unknown')}:${String(webhookReference || 'noref')}`;
+  } else {
+    dedupKey = `${event}:${paymentType || 'order'}:${orderId || metadata.user_id || 'unknown'}`;
+  }
 
   // Verrou en mémoire (instance unique)
   if (processingKeys.has(dedupKey)) {
@@ -2663,6 +2744,109 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
     const record = { key: dedupKey, status: 'processing', updatedAt: Date.now() };
     if (idx !== -1) events[idx] = record; else events.push(record);
     writeJSONFile(WEBHOOK_EVENTS_FILE, events);
+
+    // 0) Paiements des contributions équipe (PHASE D2) — pas de commande finale ici
+    if (paymentType === 'team_contribution') {
+      const teamIdMeta = parseInt(metadata.team_id, 10);
+      const participantIdMeta = parseInt(metadata.participant_id, 10);
+      const contributionIdMeta = parseInt(contributionId, 10);
+      const refStr = typeof webhookReference === 'string' ? webhookReference.trim() : '';
+
+      // Événement doit indiquer succès ou échec de paiement
+      const isSuccess = event === 'payment.success';
+      const isFailure = event === 'payment.failed' || event === 'payment.failure' || event === 'payment.cancelled';
+      if (!isSuccess && !isFailure) {
+        // événement non pertinent: marquer processed sans effet
+      } else if (!teamIdMeta || !participantIdMeta || !contributionIdMeta || !refStr) {
+        console.warn('Team contribution webhook: identifiants/référence manquants');
+      } else {
+        const payments = readJSONFile(TEAM_PAYMENTS_FILE);
+        const allPayments = Array.isArray(payments) ? payments : [];
+        const pIdx = allPayments.findIndex((p) => parseInt(p && p.paymentId, 10) === contributionIdMeta);
+        if (pIdx === -1) {
+          console.warn('Team contribution webhook: contribution introuvable', contributionIdMeta);
+        } else {
+          const contribution = allPayments[pIdx];
+
+          // Vérifications strictes: même contribution, bonne équipe/participant, référence exacte
+          const sameTeam = parseInt(contribution.teamId, 10) === teamIdMeta;
+          const sameParticipant = parseInt(contribution.participantId, 10) === participantIdMeta;
+          const sameRef = typeof contribution.transactionReference === 'string' && contribution.transactionReference === refStr;
+
+          // Montant confirmé doit correspondre exactement au montant enregistré (si fourni par GeniusPay)
+          const webhookAmountRaw = req.body.data && (req.body.data.amount ?? req.body.data.paid_amount ?? (req.body.data.payment && req.body.data.payment.amount));
+          const webhookAmount = webhookAmountRaw != null ? Number(webhookAmountRaw) : null;
+          const recordedAmount = Number(contribution.amount);
+          const amountOk = webhookAmount == null ? true : (Number.isFinite(webhookAmount) && Number.isFinite(recordedAmount) && webhookAmount === recordedAmount);
+
+          // Cohérence équipe
+          const teams = readJSONFile(TEAM_PURCHASES_FILE);
+          const tIdx = Array.isArray(teams) ? teams.findIndex((t) => parseInt(t.teamId, 10) === teamIdMeta) : -1;
+          const team = tIdx !== -1 ? teams[tIdx] : null;
+          const teamMatches = team && parseInt(team.teamId, 10) === parseInt(contribution.teamId, 10) && Number(team.beneficiaryId) === Number(team.creatorId);
+
+          if (!sameTeam || !sameParticipant || !sameRef || !amountOk || !teamMatches) {
+            console.warn('Team contribution webhook: données incohérentes, confirmation refusée', {
+              contributionId: contributionIdMeta,
+              sameTeam,
+              sameParticipant,
+              sameRef,
+              amountOk,
+            });
+          } else {
+            const nowIso = new Date().toISOString();
+            if (isSuccess) {
+              // Idempotence: contribution déjà confirmée => ne jamais recompter
+              if (contribution.paymentStatus !== 'confirmed') {
+                // Ne confirmer que si état compatible (initializing/pending)
+                if (contribution.paymentStatus === 'initializing' || contribution.paymentStatus === 'pending') {
+                  allPayments[pIdx] = {
+                    ...contribution,
+                    paymentStatus: 'confirmed',
+                    confirmedAt: nowIso,
+                    updatedAt: nowIso,
+                    transactionReference: contribution.transactionReference, // conserver
+                  };
+                  writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+
+                  // Recalculer collectedAmount UNIQUEMENT depuis contributions confirmées
+                  const paymentsAfter = readJSONFile(TEAM_PAYMENTS_FILE);
+                  const arrAfter = Array.isArray(paymentsAfter) ? paymentsAfter : [];
+                  const confirmedSum = arrAfter
+                    .filter((p) => p && parseInt(p.teamId, 10) === teamIdMeta && p.paymentStatus === 'confirmed')
+                    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+                  const teamsAfter = readJSONFile(TEAM_PURCHASES_FILE);
+                  const taIdx = Array.isArray(teamsAfter) ? teamsAfter.findIndex((t) => parseInt(t.teamId, 10) === teamIdMeta) : -1;
+                  if (taIdx !== -1) {
+                    teamsAfter[taIdx] = { ...teamsAfter[taIdx], collectedAmount: confirmedSum };
+                    writeJSONFile(TEAM_PURCHASES_FILE, teamsAfter);
+                    // PHASE E: finalisation automatique si objectif atteint (idempotente)
+                    try { tryFinalizeTeamPurchase(teamIdMeta); } catch (_) {}
+                  }
+                } else {
+                  console.warn('Team contribution webhook: état non confirmable', contribution.paymentStatus);
+                }
+              }
+            } else if (isFailure) {
+              // Ne pas invalider une contribution déjà confirmée
+              if (contribution.paymentStatus !== 'confirmed') {
+                if (contribution.paymentStatus === 'initializing' || contribution.paymentStatus === 'pending') {
+                  allPayments[pIdx] = {
+                    ...contribution,
+                    paymentStatus: 'failed',
+                    failedAt: nowIso,
+                    updatedAt: nowIso,
+                    failureReason: 'provider_failed',
+                  };
+                  writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  // Réservation libérée (n'est plus pending/initializing). collectedAmount reste basé sur confirmed uniquement.
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
     // 1) Paiements des commandes
     const orders = readJSONFile(ORDERS_FILE);
@@ -2952,6 +3136,927 @@ async function autoExpireSellerVerifications() {
 // Start immediately and then periodically.
 autoExpireSellerVerifications();
 setInterval(autoExpireSellerVerifications, SELLER_VERIFICATION_CRON_MS);
+
+// ===== TEAM PURCHASES (ACHAT EN ÉQUIPE) — PHASE B (création/consultation) =====
+// Helpers additifs, sans impact sur les flux existants.
+const TEAM_MAX_PARTICIPANTS = 10;
+const TEAM_DURATION_DAYS = 15;
+
+function computePromotionTargetAmountServer(promotion) {
+  if (!promotion) return null;
+
+  const discount = Number(promotion.discountPercent || 0);
+  if (!Number.isFinite(discount) || discount < 0 || discount > 100) {
+    return null;
+  }
+
+  if (promotion.discountedPrice != null) {
+    const discounted = Number(promotion.discountedPrice);
+    if (Number.isFinite(discounted) && discounted > 0) {
+      return discounted;
+    }
+    return null;
+  }
+
+  const price = Number(promotion.price);
+  if (!Number.isFinite(price) || price <= 0) {
+    return null;
+  }
+
+  if (discount > 0) {
+    const computed = price * (1 - discount / 100);
+    if (Number.isFinite(computed) && computed > 0) {
+      return computed;
+    }
+    return null;
+  }
+
+  return price;
+}
+
+function generateTeamInvitationCode(existingCodes) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const maxAttempts = 50;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let code = 'TEAM-';
+    for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+    if (!existingCodes.has(code)) return code;
+  }
+  throw new Error('Impossible de générer un code d\'invitation unique');
+}
+
+function isTeamExpired(team) {
+  if (!team || !team.expiresAt) return true;
+  const t = new Date(team.expiresAt).getTime();
+  return Number.isNaN(t) || t <= Date.now();
+}
+
+function effectiveTeamStatus(team) {
+  if (!team) return 'unknown';
+  if (team.status === 'completed') return 'completed';
+  if (team.status === 'cancelled') return 'cancelled';
+  if (isTeamExpired(team)) return 'expired';
+  return team.status || 'open';
+}
+
+function buildTeamView(team) {
+  const target = Number(team.targetAmount || 0);
+  const collected = Number(team.collectedAmount || 0);
+  const remaining = Math.max(0, target - collected);
+  const participants = Array.isArray(team.participants)
+    ? team.participants.map((p) => ({
+        userId: p && p.userId != null ? Number(p.userId) : null,
+        joinedAt: p && p.joinedAt ? p.joinedAt : null,
+      }))
+    : [];
+  return {
+    teamId: team.teamId,
+    promotionId: team.promotionId,
+    creatorId: team.creatorId,
+    beneficiaryId: team.beneficiaryId,
+    targetAmount: target,
+    collectedAmount: collected,
+    participants,
+    invitationCode: team.invitationCode,
+    createdAt: team.createdAt,
+    expiresAt: team.expiresAt,
+    status: effectiveTeamStatus(team),
+    finalOrderId: team.finalOrderId != null ? team.finalOrderId : null,
+    remainingAmount: remaining,
+    participantsCount: participants.length,
+    isComplete: target > 0 && collected >= target,
+  };
+}
+
+// POST /api/teams — créer une équipe depuis une promotion (bénéficiaire = créateur)
+app.post('/api/teams', authenticateToken, (req, res) => {
+  try {
+    const promotionId = parseInt(req.body.promotionId, 10);
+    if (!promotionId || Number.isNaN(promotionId)) {
+      return res.status(400).json({ error: 'promotionId requis' });
+    }
+
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotion = promotions.find((p) => parseInt(p.id, 10) === promotionId);
+    if (!promotion) {
+      return res.status(404).json({ error: 'Promotion introuvable' });
+    }
+    if (promotion.isActive === false) {
+      return res.status(400).json({ error: 'Promotion indisponible' });
+    }
+
+    const targetAmount = computePromotionTargetAmountServer(promotion);
+    if (!targetAmount || Number.isNaN(targetAmount) || targetAmount <= 0) {
+      return res.status(400).json({ error: 'Prix promotionnel invalide' });
+    }
+
+    const teams = readJSONFile(TEAM_PURCHASES_FILE);
+    const existingCodes = new Set(teams.map((t) => t.invitationCode).filter(Boolean));
+    let invitationCode;
+    try {
+      invitationCode = generateTeamInvitationCode(existingCodes);
+    } catch (e) {
+      return res.status(500).json({ error: 'Impossible de générer un code d\'invitation unique' });
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + TEAM_DURATION_DAYS * 24 * 60 * 60 * 1000);
+    const creatorId = parseInt(req.user.id, 10);
+
+    const existingTeamIds = new Set(teams.map((t) => String(t.teamId)));
+    let teamId = Date.now();
+    let attempts = 0;
+    while (existingTeamIds.has(String(teamId)) && attempts < 20) {
+      teamId = Date.now() + attempts + 1;
+      attempts++;
+    }
+    if (existingTeamIds.has(String(teamId))) {
+      return res.status(500).json({ error: 'Impossible de générer un identifiant d\'équipe unique' });
+    }
+
+    const team = {
+      teamId,
+      promotionId,
+      creatorId,
+      beneficiaryId: creatorId,
+      targetAmount,
+      collectedAmount: 0,
+      participants: [{ userId: creatorId, joinedAt: now.toISOString() }],
+      invitationCode,
+      createdAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      status: 'open',
+      finalOrderId: null,
+    };
+
+    teams.push(team);
+    writeJSONFile(TEAM_PURCHASES_FILE, teams);
+
+    return res.status(201).json({ message: 'Équipe créée', team: buildTeamView(team) });
+  } catch (error) {
+    console.error('Create team error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/teams/:id — consulter une équipe (infos + progression)
+app.get('/api/teams/:id', authenticateToken, (req, res) => {
+  try {
+    const teamId = parseInt(req.params.id, 10);
+    if (!teamId || Number.isNaN(teamId)) {
+      return res.status(400).json({ error: 'Identifiant équipe invalide' });
+    }
+
+    const teams = readJSONFile(TEAM_PURCHASES_FILE);
+    const idx = teams.findIndex((t) => parseInt(t.teamId, 10) === teamId);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Équipe introuvable' });
+    }
+
+    const team = teams[idx];
+    const newStatus = effectiveTeamStatus(team);
+    if (team.status !== newStatus && team.status !== 'completed' && team.status !== 'cancelled') {
+      teams[idx] = { ...team, status: newStatus };
+      writeJSONFile(TEAM_PURCHASES_FILE, teams);
+      return res.json({ team: buildTeamView(teams[idx]) });
+    }
+
+    return res.json({ team: buildTeamView(team) });
+  } catch (error) {
+    console.error('Get team error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/teams/:id/join — rejoindre une équipe ouverte (PHASE C)
+app.post('/api/teams/:id/join', authenticateToken, (req, res) => {
+  try {
+    const teamId = parseInt(req.params.id, 10);
+    if (!teamId || Number.isNaN(teamId)) {
+      return res.status(400).json({ error: 'Identifiant équipe invalide' });
+    }
+
+    const userId = parseInt(req.user.id, 10);
+    if (!userId || Number.isNaN(userId)) {
+      return res.status(401).json({ error: 'Utilisateur non authentifié' });
+    }
+
+    // Relire les données avant écriture (stockage JSON)
+    const teams = readJSONFile(TEAM_PURCHASES_FILE);
+    const idx = teams.findIndex((t) => parseInt(t.teamId, 10) === teamId);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Équipe introuvable' });
+    }
+
+    const team = teams[idx];
+
+    // Vérifier la promotion associée (ne pas changer la promotion)
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotion = promotions.find((p) => parseInt(p.id, 10) === parseInt(team.promotionId, 10));
+    if (!promotion) {
+      return res.status(400).json({ error: 'Promotion associée introuvable' });
+    }
+
+    // Garantir cohérence bénéficiaire/créateur (ne jamais modifier)
+    if (Number(team.beneficiaryId) !== Number(team.creatorId)) {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+
+    const status = effectiveTeamStatus(team);
+    if (status === 'completed' || status === 'cancelled') {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+    if (status === 'expired' || isTeamExpired(team)) {
+      return res.status(400).json({ error: 'Équipe expirée' });
+    }
+    if (status !== 'open' || (team.status && team.status !== 'open')) {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+
+    const participants = Array.isArray(team.participants) ? team.participants.slice() : [];
+
+    // Doublon (une seule participation par utilisateur)
+    if (participants.some((p) => Number(p && p.userId) === userId)) {
+      return res.status(409).json({ error: 'Participation déjà enregistrée' });
+    }
+
+    // Capacité (créateur inclus) — max 10
+    if (participants.length >= TEAM_MAX_PARTICIPANTS) {
+      return res.status(400).json({ error: 'Équipe complète' });
+    }
+
+    participants.push({ userId, joinedAt: new Date().toISOString() });
+
+    const updatedTeam = {
+      ...team,
+      promotionId: team.promotionId, // ne pas permettre de changer la promotion
+      creatorId: team.creatorId,     // ne jamais modifier
+      beneficiaryId: team.creatorId, // garantir beneficiaryId === creatorId
+      participants,
+      status: 'open',
+    };
+
+    teams[idx] = updatedTeam;
+    writeJSONFile(TEAM_PURCHASES_FILE, teams);
+
+    return res.json({ message: 'Participation enregistrée', team: buildTeamView(updatedTeam) });
+  } catch (error) {
+    console.error('Join team error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/teams/:id/status — progression d'une équipe (PHASE C)
+app.get('/api/teams/:id/status', authenticateToken, (req, res) => {
+  try {
+    const teamId = parseInt(req.params.id, 10);
+    if (!teamId || Number.isNaN(teamId)) {
+      return res.status(400).json({ error: 'Identifiant équipe invalide' });
+    }
+
+    const teams = readJSONFile(TEAM_PURCHASES_FILE);
+    const idx = teams.findIndex((t) => parseInt(t.teamId, 10) === teamId);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Équipe introuvable' });
+    }
+
+    const team = teams[idx];
+    const newStatus = effectiveTeamStatus(team);
+    let currentTeam = team;
+    if (team.status !== newStatus && team.status !== 'completed' && team.status !== 'cancelled') {
+      teams[idx] = { ...team, status: newStatus };
+      writeJSONFile(TEAM_PURCHASES_FILE, teams);
+      currentTeam = teams[idx];
+    }
+
+    const view = buildTeamView(currentTeam);
+    // collectedAmount provient des paiements CONFIRMÉS (aucun en phase C) — jamais d'intention de paiement.
+    return res.json({
+      teamId: view.teamId,
+      promotionId: view.promotionId,
+      creatorId: view.creatorId,
+      beneficiaryId: view.beneficiaryId,
+      targetAmount: view.targetAmount,
+      collectedAmount: view.collectedAmount,
+      remainingAmount: view.remainingAmount,
+      participantsCount: view.participantsCount,
+      maxParticipants: TEAM_MAX_PARTICIPANTS,
+      createdAt: view.createdAt,
+      expiresAt: view.expiresAt,
+      status: view.status,
+      isComplete: view.isComplete,
+    });
+  } catch (error) {
+    console.error('Get team status error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ===== TEAM CHAT (F6-C HTTP routes only; no Socket.IO) =====
+app.get('/api/teams/:id/messages', authenticateToken, (req, res) => {
+  try {
+    const rawId = String(req.params.id ?? '').trim();
+    if (!/^[1-9]\d*$/.test(rawId)) {
+      return res.status(400).json({ error: 'Identifiant équipe invalide' });
+    }
+    const teamId = parseInt(rawId, 10);
+
+    const team = findTeamById(teamId);
+    if (!team) {
+      return res.status(404).json({ error: 'Équipe introuvable' });
+    }
+
+    const userId = parseInt(req.user.id, 10);
+    if (!isTeamMember(team, userId)) {
+      return res.status(403).json({ error: 'Accès refusé à cette équipe' });
+    }
+
+    const messages = readTeamMessagesFile()
+      .filter((m) => m && parseInt(m.teamId, 10) === teamId)
+      .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+
+    return res.json({ messages });
+  } catch (error) {
+    console.error('Get team messages error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/teams/:id/messages', authenticateToken, async (req, res) => {
+  try {
+    const rawId = String(req.params.id ?? '').trim();
+    if (!/^[1-9]\d*$/.test(rawId)) {
+      return res.status(400).json({ error: 'Identifiant équipe invalide' });
+    }
+    const teamId = parseInt(rawId, 10);
+
+    const team = findTeamById(teamId);
+    if (!team) {
+      return res.status(404).json({ error: 'Équipe introuvable' });
+    }
+
+    const userId = parseInt(req.user.id, 10);
+    if (!isTeamMember(team, userId)) {
+      return res.status(403).json({ error: 'Accès refusé à cette équipe' });
+    }
+
+    if (isTeamChatReadOnly(team)) {
+      return res.status(403).json({ error: 'Le chat est en lecture seule pour cette équipe' });
+    }
+
+    const text = sanitizeTeamMessageText(req.body && req.body.message);
+    if (!text) {
+      return res.status(400).json({ error: 'Message requis (1 à 1000 caractères)' });
+    }
+
+    const saved = await appendTeamMessageSerialized({ teamId, senderId: userId, message: text });
+    if (!saved || !saved.ok || !saved.data) {
+      return res.status(500).json({ error: 'Erreur lors de l\'enregistrement du message' });
+    }
+
+    // F6-D: diffusion uniquement aux membres de la room, après sauvegarde confirmée. Jamais global.
+    try { io.to('team:' + teamId).emit('team_message', saved.data); } catch (_) {}
+
+    return res.status(201).json({ message: 'Message envoyé', data: saved.data });
+  } catch (error) {
+    console.error('Post team message error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PHASE E: finalisation idempotente d'une Ã©quipe (appelÃ©e aprÃ¨s confirmation webhook)
+// CrÃ©e UNE commande finale au nom du crÃ©ateur. Aucune garantie transactionnelle JSON.
+// ===== TEAM CHAT (F6-B storage/helpers only; no routes/socket yet) =====
+function readTeamMessagesFile() {
+  const data = readJSONFile(TEAM_MESSAGES_FILE);
+  return Array.isArray(data) ? data : [];
+}
+
+function findTeamById(teamIdInput) {
+  const raw = String(teamIdInput ?? '').trim();
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const teamId = parseInt(raw, 10);
+  const teams = readJSONFile(TEAM_PURCHASES_FILE);
+  if (!Array.isArray(teams)) return null;
+  return teams.find((t) => parseInt(t && t.teamId, 10) === teamId) || null;
+}
+
+function isTeamMember(team, userIdInput) {
+  if (!team) return false;
+  const userId = parseInt(userIdInput, 10);
+  if (!userId || Number.isNaN(userId)) return false;
+  if (Number(team.creatorId) === userId) return true;
+  const participants = Array.isArray(team.participants) ? team.participants : [];
+  return participants.some((p) => Number(p && p.userId) === userId);
+}
+
+function isTeamChatReadOnly(team) {
+  if (!team) return true;
+  const status = effectiveTeamStatus(team);
+  return status === 'completed' || status === 'cancelled' || status === 'expired';
+}
+
+let teamMessagesWriteQueue = Promise.resolve();
+function loadTeamMessagesForAppend(filePath) {
+  // Lecture spécifique (ne pas utiliser readJSONFile: il retourne [] sur erreur de parsing/lecture).
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return { ok: false, error: 'invalid_json', detail: e && e.message ? e.message : 'parse_error' };
+    }
+    if (!Array.isArray(parsed)) return { ok: false, error: 'invalid_format' };
+    return { ok: true, data: parsed };
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: true, data: [], missing: true }; // fichier absent: init autorisée
+    return { ok: false, error: 'read_error', detail: e && e.message ? e.message : 'read_error' };
+  }
+}
+
+function appendTeamMessageSerialized(entry) {
+  const op = () => {
+    try {
+      const loaded = loadTeamMessagesForAppend(TEAM_MESSAGES_FILE);
+      // IMPORTANT: ne jamais écraser un historique illisible/corrompu.
+      if (!loaded || !loaded.ok || !Array.isArray(loaded.data)) {
+        const err = loaded && loaded.error ? loaded.error : 'read_error';
+        console.error('appendTeamMessageSerialized: refuse append (history unreadable)', err, loaded && loaded.detail);
+        return { ok: false, error: err };
+      }
+      const messages = loaded.data;
+      const existingIds = new Set(messages.map((m) => String(m && m.id)));
+      let id = Date.now();
+      let attempts = 0;
+      while (existingIds.has(String(id)) && attempts < 50) {
+        id = Date.now() + attempts + 1;
+        attempts++;
+      }
+      if (existingIds.has(String(id))) return { ok: false, error: 'id_generation_failed' };
+      const created = {
+        id,
+        teamId: Number(entry.teamId),
+        senderId: Number(entry.senderId),
+        message: String(entry.message),
+        createdAt: new Date().toISOString(),
+      };
+      messages.push(created);
+      fs.writeFileSync(TEAM_MESSAGES_FILE, JSON.stringify(messages, null, 2), 'utf8');
+      return { ok: true, data: created };
+    } catch (error) {
+      console.error('appendTeamMessageSerialized error:', error);
+      return { ok: false, error: error && error.message ? error.message : 'write_error' };
+    }
+  };
+  // File sérialisée (même processus). La queue est réarmée même en cas d'erreur.
+  const p = teamMessagesWriteQueue.then(op, op);
+  teamMessagesWriteQueue = p.then(() => undefined, () => undefined);
+  return p;
+}
+
+function sanitizeTeamMessageText(textInput) {
+  if (typeof textInput !== 'string') return null;
+  const text = textInput.trim();
+  if (!text) return null;
+  if (text.length > 1000) return null;
+  return text;
+}
+
+function tryFinalizeTeamPurchase(teamIdInput) {
+  const teamId = parseInt(teamIdInput, 10);
+  if (!teamId || Number.isNaN(teamId)) return { ok: false, reason: 'invalid_team' };
+
+  const teams = readJSONFile(TEAM_PURCHASES_FILE);
+  const tIdx = Array.isArray(teams) ? teams.findIndex((t) => parseInt(t.teamId, 10) === teamId) : -1;
+  if (tIdx === -1) return { ok: false, reason: 'team_not_found' };
+
+  const team = teams[tIdx];
+  // Idempotence: déjà finalisée ou commande finale existante
+  if (team.finalOrderId || team.status === 'completed') {
+    return { ok: true, reason: 'already_completed', finalOrderId: team.finalOrderId || null };
+  }
+  if (team.status === 'cancelled' || effectiveTeamStatus(team) === 'expired' || isTeamExpired(team)) {
+    return { ok: false, reason: 'team_not_eligible' };
+  }
+  if (Number(team.beneficiaryId) !== Number(team.creatorId)) {
+    return { ok: false, reason: 'beneficiary_mismatch' };
+  }
+
+  const targetAmount = Number(team.targetAmount || 0);
+  if (!Number.isFinite(targetAmount) || targetAmount <= 0) {
+    return { ok: false, reason: 'invalid_target' };
+  }
+
+  // Recalcul serveur depuis contributions CONFIRMÉES uniquement
+  const payments = readJSONFile(TEAM_PAYMENTS_FILE);
+  const arrPayments = Array.isArray(payments) ? payments : [];
+  const confirmedSum = arrPayments
+    .filter((p) => p && parseInt(p.teamId, 10) === teamId && p.paymentStatus === 'confirmed')
+    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+  if (confirmedSum < targetAmount) {
+    // garder collectedAmount cohérent
+    if (Number(team.collectedAmount) !== confirmedSum) {
+      teams[tIdx] = { ...team, collectedAmount: confirmedSum };
+      writeJSONFile(TEAM_PURCHASES_FILE, teams);
+    }
+    return { ok: false, reason: 'not_funded', collectedAmount: confirmedSum };
+  }
+
+  // Vérifier si une commande finale équipe existe déjà (garde doublon)
+  const orders = readJSONFile(ORDERS_FILE);
+  const existingTeamOrder = Array.isArray(orders)
+    ? orders.find((o) => o && (o.teamPurchaseId == teamId || o.teamId == teamId) && o.purchaseType === 'team_purchase')
+    : null;
+  if (existingTeamOrder) {
+    teams[tIdx] = { ...team, collectedAmount: confirmedSum, status: 'completed', finalOrderId: existingTeamOrder.id };
+    writeJSONFile(TEAM_PURCHASES_FILE, teams);
+    return { ok: true, reason: 'existing_order_linked', finalOrderId: existingTeamOrder.id };
+  }
+
+  const promotions = readJSONFile(PROMOTIONS_FILE);
+  const promotion = Array.isArray(promotions)
+    ? promotions.find((p) => parseInt(p.id, 10) === parseInt(team.promotionId, 10))
+    : null;
+  if (!promotion) {
+    return { ok: false, reason: 'promotion_not_found' };
+  }
+  // Note: promotion désactivée après création n'empêche pas la finalisation si paiements confirmés suffisent.
+
+  const users = readJSONFile(USERS_FILE);
+  const creatorId = parseInt(team.creatorId, 10);
+  const creator = Array.isArray(users) ? users.find((u) => parseInt(u.id, 10) === creatorId) : null;
+  if (!creator) {
+    return { ok: false, reason: 'creator_not_found' };
+  }
+
+  const adminUser = Array.isArray(users) ? users.find((u) => u.role === 'admin') : null;
+  const seller = adminUser?.id || promotion.vendeur || null;
+  const itemPrice = Number(promotion.discountedPrice != null ? promotion.discountedPrice : promotion.price);
+  const unitPrice = Number.isFinite(itemPrice) && itemPrice > 0 ? itemPrice : targetAmount;
+
+  const validatedItems = [{
+    id: promotion.id,
+    price: unitPrice,
+    seller,
+    name: promotion.name,
+    image: promotion.image,
+    categorie: promotion.categorie,
+    vendeurNom: 'Djassa CI',
+    vendeurCompte: '',
+    quantite: 1,
+  }];
+
+  const subtotal = validatedItems.reduce((sum, item) => sum + item.price * (item.quantite || 1), 0);
+  const commissionRate = 0.05;
+  const commission = subtotal * commissionRate;
+  const total = subtotal + commission; // 5% appliquée une seule fois (comme commande individuelle)
+
+  const nowIso = new Date().toISOString();
+  const finalOrderId = Date.now();
+  const confirmedContribRefs = arrPayments
+    .filter((p) => p && parseInt(p.teamId, 10) === teamId && p.paymentStatus === 'confirmed')
+    .map((p) => ({ paymentId: p.paymentId, transactionReference: p.transactionReference, amount: p.amount, participantId: p.participantId }));
+
+  // Structure alignée sur POST /api/orders (champs additifs pour traçabilité, sans casser l'existant)
+  const finalOrder = {
+    id: finalOrderId,
+    transaction_id: `TEAM-${teamId}-${finalOrderId}`,
+    utilisateurId: creatorId, // créateur = unique bénéficiaire/propriétaire
+    seller,
+    articles: validatedItems,
+    total,
+    date: nowIso,
+    statut: 'payée', // contributions déjà confirmées
+    statutVendeur: 'a_payer_vendeur',
+    methodePaiement: 'team_contribution',
+    numeroPaiement: creator.numero || creator.phone || '',
+    nomCompte: creator.nom || creator.name || creator.username || '',
+    nomLivraison: null,
+    telLivraison: null,
+    villeCommune: null,
+    quartier: null,
+    buyerLat: null,
+    buyerLng: null,
+    // champs additifs traçabilité (lecture optionnelle par clients existants)
+    purchaseType: 'team_purchase',
+    teamId,
+    teamPurchaseId: teamId,
+    beneficiaryId: creatorId,
+    teamContributions: confirmedContribRefs,
+    teamCollectedAmount: confirmedSum,
+    teamTargetAmount: targetAmount,
+  };
+
+  const allOrders = Array.isArray(orders) ? orders : [];
+  allOrders.push(finalOrder);
+  writeJSONFile(ORDERS_FILE, allOrders);
+
+  // Mettre à jour l'équipe (si cette écriture échoue après commande, la garde doublon reliera)
+  teams[tIdx] = {
+    ...team,
+    collectedAmount: confirmedSum,
+    status: 'completed',
+    finalOrderId,
+    completedAt: nowIso,
+  };
+  writeJSONFile(TEAM_PURCHASES_FILE, teams);
+
+  // Notifications (best-effort, non dupliquées par idempotence ci-dessus)
+  try { io.emit('payment_update', { teamId: String(teamId), orderId: String(finalOrderId), status: 'completed' }); } catch (_) {}
+  if (creator && creator.fcmToken) {
+    sendFcmToToken(creator.fcmToken, {
+      title: 'Achat en équipe réussi',
+      body: `Objectif atteint ! Votre commande #${finalOrderId} a été créée.`,
+      type: 'team_purchase_completed',
+      data: { orderId: String(finalOrderId), teamId: String(teamId) },
+    }).catch(() => {});
+  }
+
+  return { ok: true, reason: 'finalized', finalOrderId };
+}
+
+// POST /api/teams/:id/contributions/init — initier une cotisation GeniusPay (PHASE D1, sécurisée)
+// Réservation locale "initializing" AVANT appel GeniusPay. Aucune confirmation de paiement ici.
+app.post('/api/teams/:id/contributions/init', authenticateToken, async (req, res) => {
+  let paymentId = null;
+  try {
+    const teamId = parseInt(req.params.id, 10);
+    if (!teamId || Number.isNaN(teamId)) {
+      return res.status(400).json({ error: 'Identifiant équipe invalide' });
+    }
+
+    const participantId = parseInt(req.user.id, 10);
+    if (!participantId || Number.isNaN(participantId)) {
+      return res.status(401).json({ error: 'Utilisateur non authentifié' });
+    }
+
+    const rawAmount = req.body.amount;
+    const amount = typeof rawAmount === 'number' ? rawAmount : Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Montant de cotisation invalide' });
+    }
+
+    // Relire les données avant traitement (stockage JSON)
+    const teams = readJSONFile(TEAM_PURCHASES_FILE);
+    const idx = teams.findIndex((t) => parseInt(t.teamId, 10) === teamId);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Équipe introuvable' });
+    }
+
+    const team = teams[idx];
+
+    // Bénéficiaire toujours le créateur
+    if (Number(team.beneficiaryId) !== Number(team.creatorId)) {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+
+    const status = effectiveTeamStatus(team);
+    if (status === 'completed' || status === 'cancelled') {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+    if (status === 'expired' || isTeamExpired(team)) {
+      return res.status(400).json({ error: 'Équipe expirée' });
+    }
+    if (status !== 'open' || (team.status && team.status !== 'open')) {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+
+    // Utilisateur membre de l'équipe
+    const participants = Array.isArray(team.participants) ? team.participants : [];
+    if (!participants.some((p) => Number(p && p.userId) === participantId)) {
+      return res.status(403).json({ error: 'Vous devez rejoindre l\'équipe avant de cotiser' });
+    }
+
+    // Promotion associée toujours valide (cohérence)
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotion = promotions.find((p) => parseInt(p.id, 10) === parseInt(team.promotionId, 10));
+    if (!promotion) {
+      return res.status(400).json({ error: 'Promotion associée introuvable' });
+    }
+    if (promotion.isActive === false) {
+      return res.status(400).json({ error: 'Promotion indisponible' });
+    }
+
+    const targetAmount = Number(team.targetAmount || 0);
+    if (!Number.isFinite(targetAmount) || targetAmount <= 0) {
+      return res.status(400).json({ error: 'Objectif d\'équipe invalide' });
+    }
+
+    // Réserver le montant restant : confirmed + (pending + initializing) = réservations
+    // Jamais comptabiliser pending/initializing comme contribution confirmée.
+    const payments = readJSONFile(TEAM_PAYMENTS_FILE);
+    const allPayments = Array.isArray(payments) ? payments : [];
+    const teamPayments = allPayments.filter((p) => parseInt(p.teamId, 10) === teamId);
+    const confirmedSum = teamPayments
+      .filter((p) => p && p.paymentStatus === 'confirmed')
+      .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const reservedSum = teamPayments
+      .filter((p) => p && (p.paymentStatus === 'pending' || p.paymentStatus === 'initializing'))
+      .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const reservedRemaining = Math.max(0, targetAmount - confirmedSum - reservedSum);
+
+    if (reservedRemaining <= 0) {
+      return res.status(400).json({ error: 'L\'objectif de l\'équipe est déjà atteint ou réservé' });
+    }
+    if (amount > reservedRemaining) {
+      return res.status(400).json({
+        error: 'Montant supérieur au reste disponible (réservations prises en compte)',
+        remainingAmount: reservedRemaining,
+      });
+    }
+
+    const users = readJSONFile(USERS_FILE);
+    const user = users.find((u) => parseInt(u.id, 10) === participantId);
+    const customerName = (user && (user.nom || user.name || user.username)) || `Participant ${participantId}`;
+    const rawPhone = (user && (user.numero || user.phone || user.telephone)) || (req.body.phone || '');
+    const phone = String(rawPhone).trim();
+
+    // Générer paymentId unique
+    const existingPaymentIds = new Set(teamPayments.map((p) => String(p.paymentId)));
+    paymentId = Date.now();
+    let pidAttempts = 0;
+    while (existingPaymentIds.has(String(paymentId)) && pidAttempts < 20) {
+      paymentId = Date.now() + pidAttempts + 1;
+      pidAttempts++;
+    }
+    if (existingPaymentIds.has(String(paymentId))) {
+      paymentId = null;
+      return res.status(500).json({ error: 'Impossible de générer un identifiant de cotisation unique' });
+    }
+
+    const nowIso = new Date().toISOString();
+    // 1) Réservation locale AVANT appel GeniusPay (statut initializing) — historique préservé
+    const reservation = {
+      paymentId,
+      teamId,
+      participantId,
+      amount,
+      transactionReference: null,
+      paymentStatus: 'initializing',
+      createdAt: nowIso,
+      confirmedAt: null,
+      failedAt: null,
+      updatedAt: nowIso,
+      provider: 'geniuspay',
+    };
+
+    // Cohérence stricte: teamId/participantId associés à cette réservation
+    if (parseInt(reservation.teamId, 10) !== teamId || parseInt(reservation.participantId, 10) !== participantId) {
+      paymentId = null;
+      return res.status(400).json({ error: 'Réservation incohérente' });
+    }
+
+    allPayments.push(reservation);
+    writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+
+    const description = `Cotisation équipe ${teamId} - paiement ${paymentId}`;
+    const metadata = {
+      payment_type: 'team_contribution',
+      team_id: String(teamId),
+      contribution_id: String(paymentId),
+      participant_id: String(participantId),
+      promotion_id: String(team.promotionId),
+    };
+
+    // Appel GeniusPay (mêmes credentials/endpoint) — format de réponse comparé aux routes existantes
+    const payload = {
+      amount: amount,
+      description,
+      customer: {
+        name: customerName,
+        phone: phone.startsWith('+') ? phone : (phone ? `+225${phone}` : ''),
+      },
+      metadata,
+    };
+
+    let response;
+    let data = null;
+    try {
+      response = await fetch('https://geniuspay.ci/api/v1/merchant/payments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': GENIUSPAY_API_KEY,
+          'X-API-Secret': GENIUSPAY_SECRET_KEY,
+        },
+        body: JSON.stringify(payload),
+      });
+      data = await response.json().catch(() => null);
+    } catch (fetchError) {
+      // Échec appel GeniusPay: marquer failed, libérer réservation, préserver historique
+      const paymentsFail = readJSONFile(TEAM_PAYMENTS_FILE);
+      const arrFail = Array.isArray(paymentsFail) ? paymentsFail : [];
+      const fIdx = arrFail.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+      if (fIdx !== -1 && arrFail[fIdx].paymentStatus === 'initializing') {
+        arrFail[fIdx] = { ...arrFail[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: 'geniuspay_request_error' };
+        writeJSONFile(TEAM_PAYMENTS_FILE, arrFail);
+      }
+      return res.status(400).json({ success: false, error: 'Initialisation GeniusPay échouée' });
+    }
+
+    const checkoutUrl = data && data.data && data.data.checkout_url;
+    const referenceRaw = data && data.data && data.data.reference;
+    const reference = typeof referenceRaw === 'string' ? referenceRaw.trim() : '';
+
+    // Exiger réponse valide + référence non vide (ne jamais inventer de référence)
+    if (!response || !response.ok || !data || data.success !== true || typeof checkoutUrl !== 'string' || !checkoutUrl || !reference) {
+      const paymentsFail = readJSONFile(TEAM_PAYMENTS_FILE);
+      const arrFail = Array.isArray(paymentsFail) ? paymentsFail : [];
+      const fIdx = arrFail.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+      if (fIdx !== -1 && arrFail[fIdx].paymentStatus === 'initializing') {
+        arrFail[fIdx] = { ...arrFail[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: (!reference ? 'missing_reference' : 'geniuspay_invalid_response') };
+        writeJSONFile(TEAM_PAYMENTS_FILE, arrFail);
+      }
+      return res.status(400).json({ success: false, error: 'Initialisation GeniusPay échouée' });
+    }
+
+    // Empêcher duplication des références (toutes tentatives confondues)
+    const paymentsRef = readJSONFile(TEAM_PAYMENTS_FILE);
+    const arrRef = Array.isArray(paymentsRef) ? paymentsRef : [];
+    const refOwner = arrRef.find((p) => p && p.transactionReference === reference);
+    if (refOwner && parseInt(refOwner.paymentId, 10) !== parseInt(paymentId, 10)) {
+      const fIdx = arrRef.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+      if (fIdx !== -1 && arrRef[fIdx].paymentStatus === 'initializing') {
+        arrRef[fIdx] = { ...arrRef[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: 'duplicate_reference' };
+        writeJSONFile(TEAM_PAYMENTS_FILE, arrRef);
+      }
+      return res.status(409).json({ error: 'Référence de transaction déjà enregistrée' });
+    }
+
+    // Re-vérifier contraintes clés avant passage pending (fenêtre de concurrence JSON)
+    const teamsAfter = readJSONFile(TEAM_PURCHASES_FILE);
+    const idxAfter = teamsAfter.findIndex((t) => parseInt(t.teamId, 10) === teamId);
+    if (idxAfter === -1) {
+      const fIdx = arrRef.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+      if (fIdx !== -1 && arrRef[fIdx].paymentStatus === 'initializing') {
+        arrRef[fIdx] = { ...arrRef[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: 'team_missing' };
+        writeJSONFile(TEAM_PAYMENTS_FILE, arrRef);
+      }
+      return res.status(409).json({ error: 'Équipe introuvable après initialisation paiement' });
+    }
+    const teamAfter = teamsAfter[idxAfter];
+    const statusAfter = effectiveTeamStatus(teamAfter);
+    if (statusAfter !== 'open' || isTeamExpired(teamAfter) || Number(teamAfter.beneficiaryId) !== Number(teamAfter.creatorId)) {
+      const fIdx = arrRef.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+      if (fIdx !== -1 && arrRef[fIdx].paymentStatus === 'initializing') {
+        arrRef[fIdx] = { ...arrRef[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: 'team_unavailable' };
+        writeJSONFile(TEAM_PAYMENTS_FILE, arrRef);
+      }
+      return res.status(409).json({ error: 'Équipe non disponible après initialisation paiement' });
+    }
+
+    // Réponse GeniusPay valide + référence présente → passer initializing -> pending (même enregistrement, historique préservé)
+    const paymentsFinal = readJSONFile(TEAM_PAYMENTS_FILE);
+    const arrFinal = Array.isArray(paymentsFinal) ? paymentsFinal : [];
+    const tIdx = arrFinal.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+    if (tIdx === -1) {
+      return res.status(500).json({ error: 'Réservation introuvable' });
+    }
+    const rec = arrFinal[tIdx];
+    if (parseInt(rec.teamId, 10) !== teamId || parseInt(rec.participantId, 10) !== participantId) {
+      return res.status(400).json({ error: 'Réservation incohérente' });
+    }
+    // Ne pas modifier le montant cible de l'équipe ; pending != confirmé
+    arrFinal[tIdx] = {
+      ...rec,
+      transactionReference: reference,
+      paymentStatus: 'pending',
+      updatedAt: new Date().toISOString(),
+      checkoutInitializedAt: new Date().toISOString(),
+    };
+    writeJSONFile(TEAM_PAYMENTS_FILE, arrFinal);
+
+    return res.json({
+      success: true,
+      checkout_url: checkoutUrl,
+      reference,
+      contribution: {
+        paymentId,
+        teamId,
+        participantId,
+        amount: rec.amount,
+        paymentStatus: 'pending',
+      },
+    });
+  } catch (error) {
+    console.error('Team contribution init error:', error);
+    // Best-effort: libérer réservation initializing en cas d'erreur inattendue (historique préservé)
+    try {
+      if (paymentId != null) {
+        const paymentsFail = readJSONFile(TEAM_PAYMENTS_FILE);
+        const arrFail = Array.isArray(paymentsFail) ? paymentsFail : [];
+        const fIdx = arrFail.findIndex((p) => parseInt(p.paymentId, 10) === parseInt(paymentId, 10));
+        if (fIdx !== -1 && arrFail[fIdx].paymentStatus === 'initializing') {
+          arrFail[fIdx] = { ...arrFail[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: 'unexpected_error' };
+          writeJSONFile(TEAM_PAYMENTS_FILE, arrFail);
+        }
+      }
+    } catch (_) {}
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
 
 server.listen(PORT, () => {
   console.log(`🚀 Djassa CI Backend Server running on port ${PORT}`);
