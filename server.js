@@ -168,6 +168,20 @@ async function sendFcmToUsers(users, { title, body, type, data = {} }) {
   return { sent, skipped, errors };
 }
 
+// (Notifications team/savings, additif) Résout les destinataires par id utilisateur.
+// Effet secondaire best-effort: ne jamais bloquer le traitement métier.
+function resolveFcmUsersByIds(userIds, usersArray) {
+  try {
+    const ids = Array.isArray(userIds) ? Array.from(new Set(userIds.map((id) => parseInt(id, 10)).filter((n) => Number.isFinite(n) && n > 0))) : [];
+    const all = Array.isArray(usersArray) ? usersArray : readJSONFile(USERS_FILE);
+    const arr = Array.isArray(all) ? all : [];
+    return ids.map((id) => arr.find((u) => u && parseInt(u.id, 10) === id)).filter(Boolean);
+  } catch (e) {
+    console.error('resolveFcmUsersByIds error:', e && e.message ? e.message : e);
+    return [];
+  }
+}
+
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
@@ -313,6 +327,8 @@ const PROMOTIONS_FILE = path.join(JSON_STORAGE_DIR, 'promotions.json');
 const TEAM_PURCHASES_FILE = path.join(JSON_STORAGE_DIR, 'team_purchases.json');
 const TEAM_PAYMENTS_FILE = path.join(JSON_STORAGE_DIR, 'team_payments.json');
 const TEAM_MESSAGES_FILE = path.join(JSON_STORAGE_DIR, 'team_messages.json');
+const PROMOTION_SAVINGS_FILE = path.join(JSON_STORAGE_DIR, 'promotion_savings.json');
+const PROMOTION_SAVINGS_PAYMENTS_FILE = path.join(JSON_STORAGE_DIR, 'promotion_savings_payments.json');
 const PASSWORD_RESULTS_FILE = path.join(JSON_STORAGE_DIR, 'password_resets.json');
 
 const ensureJSONFilesDir = () => {
@@ -498,6 +514,12 @@ const initializeData = () => {
   }
   if (!fs.existsSync(TEAM_MESSAGES_FILE)) {
     writeJSONFile(TEAM_MESSAGES_FILE, []);
+  }
+  if (!fs.existsSync(PROMOTION_SAVINGS_FILE)) {
+    writeJSONFile(PROMOTION_SAVINGS_FILE, []);
+  }
+  if (!fs.existsSync(PROMOTION_SAVINGS_PAYMENTS_FILE)) {
+    writeJSONFile(PROMOTION_SAVINGS_PAYMENTS_FILE, []);
   }
 };
 
@@ -2684,7 +2706,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Djassa CI API is running', timestamp: new Date().toISOString() });
 });
 
-app.post('/api/payment/geniuspay/webhook', (req, res) => {
+app.post('/api/payment/geniuspay/webhook', async (req, res) => {
   const signature = req.headers['x-webhook-signature'];
   const timestamp = req.headers['x-webhook-timestamp'];
   const payload = JSON.stringify(req.body);
@@ -2702,7 +2724,7 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   const event = req.body.event;
   const metadata = req.body.data?.metadata || {};
   const orderId = metadata.order_id;
-  const paymentType = metadata.payment_type; // 'order' | 'seller_certification' | 'team_contribution'
+  const paymentType = metadata.payment_type; // 'order' | 'seller_certification' | 'team_contribution' | 'promotion_savings_contribution'
   const contributionId = metadata.contribution_id;
   const webhookReference =
     (req.body.data && (req.body.data.reference || req.body.data.payment_reference || req.body.data.transaction_reference)) ||
@@ -2714,6 +2736,9 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
   let dedupKey;
   if (paymentType === 'team_contribution') {
     dedupKey = `${event}:team_contribution:${String(contributionId || 'unknown')}:${String(webhookReference || 'noref')}`;
+  } else if (paymentType === 'promotion_savings_contribution') {
+    const scid = metadata.contribution_id;
+    dedupKey = `${event}:promotion_savings_contribution:${String(scid || 'unknown')}:${String(webhookReference || 'noref')}`;
   } else {
     dedupKey = `${event}:${paymentType || 'order'}:${orderId || metadata.user_id || 'unknown'}`;
   }
@@ -2808,6 +2833,14 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
                     transactionReference: contribution.transactionReference, // conserver
                   };
                   writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  // FCM (best-effort, transition réelle -> confirmed uniquement): participant + créateur.
+                  try {
+                    const _teamUsers = readJSONFile(USERS_FILE) || [];
+                    const _partU = _teamUsers.find((u)=>parseInt(u&&u.id,10)===parseInt(contribution.participantId,10));
+                    const _creU = team ? _teamUsers.find((u)=>parseInt(u&&u.id,10)===parseInt(team.creatorId,10)) : null;
+                    if (_partU && _partU.fcmToken) sendFcmToToken(_partU.fcmToken,{title:"Contribution confirmée",body:"Votre contribution a été confirmée.",type:"team_contribution_confirmed",data:{teamId:String(teamIdMeta),contributionId:String(contribution.paymentId||contributionIdMeta)}}).catch(()=>{});
+                    if (_creU && _creU.fcmToken && parseInt(_creU.id,10)!==parseInt(_partU&&_partU.id,10)) sendFcmToToken(_creU.fcmToken,{title:"Contribution confirmée",body:"Une contribution a été confirmée dans votre équipe.",type:"team_contribution_confirmed",data:{teamId:String(teamIdMeta),contributionId:String(contribution.paymentId||contributionIdMeta)}}).catch(()=>{});
+                  } catch (_) {}
 
                   // Recalculer collectedAmount UNIQUEMENT depuis contributions confirmées
                   const paymentsAfter = readJSONFile(TEAM_PAYMENTS_FILE);
@@ -2839,9 +2872,108 @@ app.post('/api/payment/geniuspay/webhook', (req, res) => {
                     failureReason: 'provider_failed',
                   };
                   writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  // FCM (best-effort, transition réelle -> failed uniquement, jamais si confirmed): participant.
+                  try {
+                    const _partU = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===parseInt(contribution.participantId,10));
+                    if (_partU && _partU.fcmToken) sendFcmToToken(_partU.fcmToken,{title:"Contribution échouée",body:"Votre paiement n'a pas été confirmé.",type:"team_contribution_failed",data:{teamId:String(teamIdMeta),contributionId:String(contribution.paymentId||contributionIdMeta)}}).catch(()=>{});
+                  } catch (_) {}
                   // Réservation libérée (n'est plus pending/initializing). collectedAmount reste basé sur confirmed uniquement.
                 }
               }
+            }
+          }
+        }
+      }
+    }
+
+    // 0b) Paiements "Acheter petit a petit" (promotion_savings_contribution) — isole, sans impact sur team/order/certif
+    // C1: lecture sure (loadPromotionSavingsFileSafe). C2: modifs critiques serialisees (runPromotionSavingsSerialized), pas d'appel imbrique (finalisation hors file). C4: ecriture critique -> throw => webhook 500 (retriable; dedup/idempotence protegent).
+    if (paymentType === 'promotion_savings_contribution') {
+      const planIdMeta = normalizePositiveInt(metadata.plan_id);
+      const userIdMeta = normalizePositiveInt(metadata.user_id);
+      const contribIdMeta = normalizePositiveInt(metadata.contribution_id);
+      const refStrS = typeof webhookReference === 'string' ? webhookReference.trim() : '';
+      const isSuccessS = event === 'payment.success';
+      const isFailureS = event === 'payment.failed' || event === 'payment.failure' || event === 'payment.cancelled';
+      if (isSuccessS || isFailureS) {
+        if (!planIdMeta || !userIdMeta || !contribIdMeta || !refStrS) {
+          console.warn('Promotion savings webhook: identifiants/reference manquants');
+        } else {
+          const webhookAmountRawS = req.body.data && (req.body.data.amount ?? req.body.data.paid_amount ?? (req.body.data.payment && req.body.data.payment.amount));
+          const webhookAmountS = webhookAmountRawS != null ? Number(webhookAmountS) : null;
+          let savingsFinalizeTarget = null;
+          await runPromotionSavingsSerialized(() => {
+            try {
+              const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+              const plansL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_FILE);
+              if (!paysL.ok || !plansL.ok) { console.error('Promotion savings webhook: stockage illisible/corrompu, confirmation refusee', paysL.error, plansL.error); throw new Error('savings_storage_unreadable'); }
+              const allSP = paysL.data;
+              const plansS = plansL.data;
+              const spIdx = allSP.findIndex((p) => parseInt(p && p.paymentId, 10) === contribIdMeta);
+              if (spIdx === -1) { console.warn('Promotion savings webhook: contribution introuvable', contribIdMeta); return; }
+              const contrib = allSP[spIdx];
+              const samePlan = parseInt(contrib.planId, 10) === planIdMeta;
+              const sameUser = parseInt(contrib.userId, 10) === userIdMeta;
+              const sameRef = typeof contrib.transactionReference === 'string' && contrib.transactionReference === refStrS;
+              const recordedAmountS = Number(contrib.amount);
+              const amountOkS = webhookAmountS == null ? true : (Number.isFinite(webhookAmountS) && Number.isFinite(recordedAmountS) && webhookAmountS === recordedAmountS);
+              const planSIdx = plansS.findIndex((p) => parseInt(p && p.planId, 10) === planIdMeta);
+              const planS = planSIdx !== -1 ? plansS[planSIdx] : null;
+              const planMatches = planS && parseInt(planS.planId, 10) === parseInt(contrib.planId, 10) && parseInt(planS.userId, 10) === parseInt(contrib.userId, 10);
+              if (!samePlan || !sameUser || !sameRef || !amountOkS || !planMatches) {
+                console.warn('Promotion savings webhook: donnees incoherentes, confirmation refusee', { contribIdMeta, samePlan, sameUser, sameRef, amountOkS });
+                return;
+              }
+              const nowIsoS = new Date().toISOString();
+              if (isSuccessS) {
+                if (contrib.paymentStatus === 'confirmed') return; // idempotent
+                if (contrib.paymentStatus === 'initializing' || contrib.paymentStatus === 'pending') {
+                  allSP[spIdx] = { ...contrib, paymentStatus: 'confirmed', confirmedAt: nowIsoS, updatedAt: nowIsoS, transactionReference: contrib.transactionReference };
+                  fs.writeFileSync(PROMOTION_SAVINGS_PAYMENTS_FILE, JSON.stringify(allSP, null, 2), 'utf8');
+                  // FCM (best-effort, transition réelle -> confirmed): propriétaire.
+                  try {
+                    const _ownerU = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===userIdMeta);
+                    if (_ownerU && _ownerU.fcmToken) sendFcmToToken(_ownerU.fcmToken,{title:"Versement confirmé",body:"Votre versement a été confirmé.",type:"savings_contribution_confirmed",data:{planId:String(planIdMeta),contributionId:String(contribIdMeta)}}).catch(()=>{});
+                  } catch (_) {}
+                  const confirmedSumS = roundMoney2(allSP
+                    .filter((p) => p && parseInt(p.planId, 10) === planIdMeta && p.paymentStatus === 'confirmed')
+                    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0));
+                  const paIdx = plansS.findIndex((p) => parseInt(p && p.planId, 10) === planIdMeta);
+                  if (paIdx !== -1) {
+                    const targetS = roundMoney2(Number(plansS[paIdx].targetAmount || 0));
+                    const remainingS = roundMoney2(Math.max(0, targetS - confirmedSumS));
+                    plansS[paIdx] = { ...plansS[paIdx], collectedAmount: confirmedSumS, remainingAmount: remainingS, updatedAt: nowIsoS };
+                    fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plansS, null, 2), 'utf8');
+                    if (targetS > 0 && confirmedSumS >= targetS) savingsFinalizeTarget = planIdMeta; // finalisation hors file (evite imbriquation)
+                  }
+                }
+              } else if (isFailureS) {
+                if (contrib.paymentStatus !== 'confirmed') {
+                  if (contrib.paymentStatus === 'initializing' || contrib.paymentStatus === 'pending') {
+                    allSP[spIdx] = { ...contrib, paymentStatus: 'failed', failedAt: nowIsoS, updatedAt: nowIsoS, failureReason: 'provider_failed' };
+                    fs.writeFileSync(PROMOTION_SAVINGS_PAYMENTS_FILE, JSON.stringify(allSP, null, 2), 'utf8');
+                    // FCM (best-effort, transition réelle -> failed, jamais si confirmed): propriétaire.
+                    try {
+                      const _ownerUF = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===userIdMeta);
+                      if (_ownerUF && _ownerUF.fcmToken) sendFcmToToken(_ownerUF.fcmToken,{title:"Versement echoue",body:"Votre paiement n'a pas ete confirme.",type:"savings_contribution_failed",data:{planId:String(planIdMeta),contributionId:String(contribIdMeta)}}).catch(()=>{});
+                    } catch (_) {}
+                  }
+                }
+              }
+            } catch (e) {
+              if (e && e.message === 'savings_storage_unreadable') throw e;
+              if (e && typeof e.message === 'string' && e.message.indexOf('savings_') === 0) throw e; // ecriture critique -> webhook 500 retriable
+              console.error('Promotion savings webhook serialized error:', e && e.message ? e.message : e);
+              throw e;
+            }
+          });
+          if (savingsFinalizeTarget) {
+            // Finalisation HORS runPromotionSavingsSerialized (evite deadlock/imbriquation). Erreur de finalisation -> throw => webhook 500 retriable; la contribution reste confirmed (idempotence/dedup protegent).
+            const fin = await tryFinalizePromotionSavingsPlan(savingsFinalizeTarget);
+            if (fin && fin.reason === 'savings_storage_unreadable') throw new Error('savings_storage_unreadable');
+            if (fin && fin.ok === false && typeof fin.reason === 'string' && fin.reason.indexOf('savings_') === 0) {
+              console.error('Promotion savings finalize after webhook returned critical failure:', fin.reason);
+              throw new Error(fin.reason);
             }
           }
         }
@@ -3203,11 +3335,29 @@ function buildTeamView(team) {
   const target = Number(team.targetAmount || 0);
   const collected = Number(team.collectedAmount || 0);
   const remaining = Math.max(0, target - collected);
+  // Sommes confirmées par participant (additif, lecture seule) — jamais pending/initializing.
+  let confirmedByParticipant = Object.create(null);
+  try {
+    const paymentsRaw = readJSONFile(TEAM_PAYMENTS_FILE);
+    const paymentsArr = Array.isArray(paymentsRaw) ? paymentsRaw : [];
+    paymentsArr.forEach((p) => {
+      if (!p || parseInt(p.teamId, 10) !== parseInt(team.teamId, 10)) return;
+      if (p.paymentStatus !== 'confirmed') return;
+      const uid = parseInt(p.participantId, 10);
+      if (!Number.isFinite(uid) || uid <= 0) return;
+      confirmedByParticipant[uid] = (Number(confirmedByParticipant[uid]) || 0) + (Number(p.amount) || 0);
+    });
+  } catch (_) {}
   const participants = Array.isArray(team.participants)
-    ? team.participants.map((p) => ({
-        userId: p && p.userId != null ? Number(p.userId) : null,
-        joinedAt: p && p.joinedAt ? p.joinedAt : null,
-      }))
+    ? team.participants.map((p) => {
+        const uid = p && p.userId != null ? Number(p.userId) : null;
+        const paid = uid != null ? (Number(confirmedByParticipant[uid]) || 0) : 0;
+        return {
+          userId: uid,
+          joinedAt: p && p.joinedAt ? p.joinedAt : null,
+          confirmedAmountPaid: paid,
+        };
+      })
     : [];
   return {
     teamId: team.teamId,
@@ -3291,6 +3441,14 @@ app.post('/api/teams', authenticateToken, (req, res) => {
 
     teams.push(team);
     writeJSONFile(TEAM_PURCHASES_FILE, teams);
+
+    // FCM (best-effort, après sauvegarde): équipe créée.
+    try {
+      const creatorUser = (readJSONFile(USERS_FILE) || []).find((u) => parseInt(u && u.id, 10) === creatorId);
+      if (creatorUser && creatorUser.fcmToken) {
+        sendFcmToToken(creatorUser.fcmToken, { title: 'Equipe creee', body: 'Votre equipe d\'achat a ete creee. Partagez le code d\'invitation.', type: 'team_created', data: { teamId: String(team.teamId) } }).catch(() => {});
+      }
+    } catch (_) {}
 
     return res.status(201).json({ message: 'Équipe créée', team: buildTeamView(team) });
   } catch (error) {
@@ -3399,9 +3557,104 @@ app.post('/api/teams/:id/join', authenticateToken, (req, res) => {
     teams[idx] = updatedTeam;
     writeJSONFile(TEAM_PURCHASES_FILE, teams);
 
+    // FCM (best-effort, après sauvegarde, ajout réel uniquement): créateur + membres déjà présents, exclure le nouveau.
+    try {
+      const existingParticipantIds = (Array.isArray(team.participants) ? team.participants : [])
+        .map((p) => parseInt(p && p.userId, 10))
+        .filter((id) => Number.isFinite(id) && id > 0 && id !== userId);
+      const recipients = resolveFcmUsersByIds(existingParticipantIds);
+      if (recipients.length > 0) {
+        sendFcmToUsers(recipients, {
+          title: 'Nouvel équipier !',
+          body: "Un nouveau membre vient de rejoindre votre équipe d'achat.",
+          type: 'team_participant_joined',
+          data: { teamId: String(teamId) },
+        }).catch(() => {});
+      }
+    } catch (_) {}
+
     return res.json({ message: 'Participation enregistrée', team: buildTeamView(updatedTeam) });
   } catch (error) {
     console.error('Join team error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/teams/join-by-code — retrouver/rejoindre une équipe par code d'invitation (additif, navigation/UI)
+app.post('/api/teams/join-by-code', authenticateToken, (req, res) => {
+  try {
+    const rawCode = req.body && (req.body.invitationCode || req.body.code);
+    const code = typeof rawCode === 'string' ? rawCode.trim() : '';
+    if (!code) {
+      return res.status(400).json({ error: 'Code d\'invitation requis' });
+    }
+    const userId = parseInt(req.user.id, 10);
+    if (!userId || Number.isNaN(userId)) {
+      return res.status(401).json({ error: 'Utilisateur non authentifié' });
+    }
+    // Relire les données avant écriture (stockage JSON)
+    const teams = readJSONFile(TEAM_PURCHASES_FILE);
+    const idx = Array.isArray(teams)
+      ? teams.findIndex((t) => t && typeof t.invitationCode === 'string' && t.invitationCode.trim().toUpperCase() === code.toUpperCase())
+      : -1;
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Équipe introuvable. Vérifiez le code d\'invitation.' });
+    }
+    const team = teams[idx];
+    // Vérifier la promotion associée (ne pas changer la promotion)
+    const promotions = readJSONFile(PROMOTIONS_FILE);
+    const promotion = Array.isArray(promotions)
+      ? promotions.find((p) => parseInt(p.id, 10) === parseInt(team.promotionId, 10))
+      : null;
+    if (!promotion) {
+      return res.status(400).json({ error: 'Promotion associée introuvable' });
+    }
+    // Garantir cohérence bénéficiaire/créateur (ne jamais modifier)
+    if (Number(team.beneficiaryId) !== Number(team.creatorId)) {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+    const status = effectiveTeamStatus(team);
+    if (status === 'completed' || status === 'cancelled') {
+      return res.status(400).json({ error: 'Équipe terminée' });
+    }
+    if (status === 'expired' || isTeamExpired(team)) {
+      return res.status(400).json({ error: 'Équipe expirée' });
+    }
+    if (status !== 'open' || (team.status && team.status !== 'open')) {
+      return res.status(400).json({ error: 'Équipe non disponible' });
+    }
+    const participants = Array.isArray(team.participants) ? team.participants.slice() : [];
+    // Idempotent (additif, route dédiée) : déjà membre -> renvoyer l'équipe pour navigation.
+    if (participants.some((p) => Number(p && p.userId) === userId)) {
+      return res.json({ message: 'Participation déjà enregistrée', team: buildTeamView(team) });
+    }
+    // Capacité (créateur inclus) — max 10
+    if (participants.length >= TEAM_MAX_PARTICIPANTS) {
+      return res.status(400).json({ error: 'Équipe complète' });
+    }
+    participants.push({ userId, joinedAt: new Date().toISOString() });
+    const updatedTeam = {
+      ...team,
+      promotionId: team.promotionId, // ne pas permettre de changer la promotion
+      creatorId: team.creatorId,     // ne jamais modifier
+      beneficiaryId: team.creatorId, // garantir beneficiaryId === creatorId
+      participants,
+      status: 'open',
+    };
+    teams[idx] = updatedTeam;
+    writeJSONFile(TEAM_PURCHASES_FILE, teams);
+
+    // FCM (best-effort, après sauvegarde, ajout réel uniquement): créateur + membres déjà présents, exclure le nouveau.
+    try {
+      const existingParticipantIds = (Array.isArray(team.participants) ? team.participants : []).map((pp) => parseInt(pp && pp.userId, 10)).filter((id) => Number.isFinite(id) && id > 0 && id !== userId);
+      const recipients = resolveFcmUsersByIds(existingParticipantIds);
+      if (recipients.length > 0) {
+        sendFcmToUsers(recipients, { title: 'Nouvel equipier !', body: "Un nouveau membre vient de rejoindre votre equipe d'achat.", type: 'team_participant_joined', data: { teamId: String(teamId) } }).catch(() => {});
+      }
+    } catch (_) {}
+    return res.json({ message: 'Participation enregistrée', team: buildTeamView(updatedTeam) });
+  } catch (error) {
+    console.error('Join team by code error:', error);
     return res.status(500).json({ error: 'Server error' });
   }
 });
@@ -3760,19 +4013,27 @@ function tryFinalizeTeamPurchase(teamIdInput) {
     status: 'completed',
     finalOrderId,
     completedAt: nowIso,
+    goalNotifiedAt: team.goalNotifiedAt || nowIso,
+    orderNotifiedAt: team.orderNotifiedAt || nowIso,
   };
   writeJSONFile(TEAM_PURCHASES_FILE, teams);
 
-  // Notifications (best-effort, non dupliquées par idempotence ci-dessus)
+  // Notifications (best-effort, idempotence finale protège contre doublons d'ordre; garde persistée orderNotifiedAt/goalNotifiedAt).
   try { io.emit('payment_update', { teamId: String(teamId), orderId: String(finalOrderId), status: 'completed' }); } catch (_) {}
-  if (creator && creator.fcmToken) {
-    sendFcmToToken(creator.fcmToken, {
-      title: 'Achat en équipe réussi',
-      body: `Objectif atteint ! Votre commande #${finalOrderId} a été créée.`,
-      type: 'team_purchase_completed',
-      data: { orderId: String(finalOrderId), teamId: String(teamId) },
-    }).catch(() => {});
-  }
+  try {
+    const _allParts = Array.isArray(team.participants) ? team.participants.map((p)=>parseInt(p&&p.userId,10)).filter((id)=>Number.isFinite(id)&&id>0) : [];
+    const _users = readJSONFile(USERS_FILE) || [];
+    const _byId = new Map(_users.map((u)=>[parseInt(u&&u.id,10),u]));
+    for (const uid of _allParts) {
+      const u = _byId.get(uid); if (!u || !u.fcmToken) continue;
+      if (!team.goalNotifiedAt) sendFcmToToken(u.fcmToken,{title:"Objectif atteint",body:"L'objectif de l'équipe est atteint.",type:"team_goal_reached",data:{teamId:String(teamId)}}).catch(()=>{});
+      if (!team.orderNotifiedAt) {
+        sendFcmToToken(u.fcmToken,{title:"Commande créée",body:`Commande #${finalOrderId} créée pour votre équipe.`,type:"team_order_created",data:{teamId:String(teamId),orderId:String(finalOrderId)}}).catch(()=>{});
+        // compat existant (créateur / clients historiques)
+        if (uid === parseInt(creatorId,10)) sendFcmToToken(u.fcmToken,{title:"Achat en équipe réussi",body:`Objectif atteint ! Votre commande #${finalOrderId} a été créée.`,type:"team_purchase_completed",data:{orderId:String(finalOrderId),teamId:String(teamId)}}).catch(()=>{});
+      }
+    }
+  } catch (_) {}
 
   return { ok: true, reason: 'finalized', finalOrderId };
 }
@@ -4028,6 +4289,18 @@ app.post('/api/teams/:id/contributions/init', authenticateToken, async (req, res
     };
     writeJSONFile(TEAM_PAYMENTS_FILE, arrFinal);
 
+    // FCM (best-effort, après init réussie + référence/checkout valides): contribution initiée (en attente), jamais "confirmée".
+    try {
+      if (user) {
+        sendFcmToToken(user.fcmToken, {
+          title: 'Contribution initiée',
+          body: 'Votre paiement est en attente de confirmation.',
+          type: 'team_contribution_initiated',
+          data: { teamId: String(teamId), contributionId: String(paymentId) },
+        }).catch(() => {});
+      }
+    } catch (_) {}
+
     return res.json({
       success: true,
       checkout_url: checkoutUrl,
@@ -4052,6 +4325,379 @@ app.post('/api/teams/:id/contributions/init', authenticateToken, async (req, res
           arrFail[fIdx] = { ...arrFail[fIdx], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: 'unexpected_error' };
           writeJSONFile(TEAM_PAYMENTS_FILE, arrFail);
         }
+      }
+    } catch (_) {}
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
+// ===== "ACHETER PETIT A PETIT" (promotion savings) — additif, isole team/order/classique =====
+// payment_type: promotion_savings_contribution. Confirmation UNIQUEMENT via webhook HMAC+dedup.
+let promotionSavingsWriteQueue = Promise.resolve();
+
+function loadPromotionSavingsFileSafe(filePath) {
+  // Ne pas utiliser readJSONFile ici: il retourne [] sur erreur de parse/lecture (risque ecrasement).
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) { return { ok: false, error: 'invalid_json', detail: e && e.message ? e.message : 'parse_error' }; }
+    if (!Array.isArray(parsed)) return { ok: false, error: 'invalid_format' };
+    return { ok: true, data: parsed };
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: true, data: [], missing: true };
+    return { ok: false, error: 'read_error', detail: e && e.message ? e.message : 'read_error' };
+  }
+}
+
+function runPromotionSavingsSerialized(op) {
+  const p = promotionSavingsWriteQueue.then(op, op);
+  promotionSavingsWriteQueue = p.then(() => undefined, () => undefined);
+  return p;
+}
+
+// Helpers savings (additifs): mutations de statut contribution avec ecriture verifiee.
+// A appeler UNIQUEMENT depuis une operation deja serialisee (runPromotionSavingsSerialized)
+// ou comme unique op passee a runPromotionSavingsSerialized (jamais imbrique).
+function markSavingsContributionFailedIfInitializing(paymentId, reason) {
+  const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+  if (!paysL.ok) return { ok: false, error: 'storage_unreadable' };
+  const arr = paysL.data;
+  const i = arr.findIndex((p) => parseInt(p && p.paymentId, 10) === parseInt(paymentId, 10));
+  if (i === -1) return { ok: false, error: 'not_found' };
+  const st = arr[i].paymentStatus;
+  if (st === 'confirmed' || st === 'pending') return { ok: false, skipped: true, status: st }; // ne jamais ecraser confirmed; pending = reference potentiellement payable
+  if (st !== 'initializing') return { ok: false, skipped: true, status: st };
+  arr[i] = { ...arr[i], paymentStatus: 'failed', failedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), failureReason: reason || 'init_failed' };
+  try { fs.writeFileSync(PROMOTION_SAVINGS_PAYMENTS_FILE, JSON.stringify(arr, null, 2), 'utf8'); } catch (e) { console.error('savings mark failed write error:', e && e.message ? e.message : e); return { ok: false, error: 'write_error' }; }
+  return { ok: true };
+}
+
+function markSavingsContributionPending(paymentId, reference, checkoutUrl) {
+  const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+  if (!paysL.ok) return { ok: false, error: 'storage_unreadable' };
+  const arr = paysL.data;
+  const i = arr.findIndex((p) => parseInt(p && p.paymentId, 10) === parseInt(paymentId, 10));
+  if (i === -1) return { ok: false, error: 'not_found' };
+  const st = arr[i].paymentStatus;
+  if (st === 'confirmed') return { ok: true, already: true };
+  if (st === 'pending' && String(arr[i].transactionReference || '') === String(reference || '')) return { ok: true, already: true };
+  if (st !== 'initializing') return { ok: false, skipped: true, status: st };
+  arr[i] = { ...arr[i], paymentStatus: 'pending', transactionReference: String(reference || '').trim(), checkoutUrl, updatedAt: new Date().toISOString() };
+  try { fs.writeFileSync(PROMOTION_SAVINGS_PAYMENTS_FILE, JSON.stringify(arr, null, 2), 'utf8'); } catch (e) { console.error('savings mark pending write error:', e && e.message ? e.message : e); return { ok: false, error: 'write_error' }; }
+  return { ok: true };
+}
+
+function normalizePositiveInt(input) {
+  const raw = String(input ?? '').trim();
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  return parseInt(raw, 10);
+}
+
+function roundMoney2(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 100) / 100;
+}
+
+function computePromotionSavingsTargetServer(promotion) {
+  const v = computePromotionTargetAmountServer(promotion);
+  if (v == null || !Number.isFinite(Number(v)) || Number(v) <= 0) return null;
+  return roundMoney2(v);
+}
+
+function buildPromotionSavingsPlanView(plan, payments) {
+  const arr = Array.isArray(payments) ? payments : [];
+  const planId = parseInt(plan && plan.planId, 10);
+  const confirmed = arr.filter((p) => p && parseInt(p.planId, 10) === planId && p.paymentStatus === 'confirmed');
+  const collected = roundMoney2(confirmed.reduce((s, p) => s + (Number(p.amount) || 0), 0));
+  const target = roundMoney2(plan.targetAmount || 0);
+  const remaining = roundMoney2(Math.max(0, target - collected));
+  const progress = target > 0 ? Math.min(1, collected / target) : 0;
+  const contributions = arr
+    .filter((p) => p && parseInt(p.planId, 10) === planId)
+    .map((p) => ({
+      paymentId: p.paymentId, planId: p.planId, amount: p.amount,
+      paymentStatus: p.paymentStatus,
+      transactionReference: p.transactionReference || null,
+      createdAt: p.createdAt || null, confirmedAt: p.confirmedAt || null, failedAt: p.failedAt || null,
+    }))
+    .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+  return {
+    planId: plan.planId, userId: plan.userId, promotionId: plan.promotionId,
+    promotionName: plan.promotionName || null,
+    targetAmount: target, collectedAmount: collected, remainingAmount: remaining,
+    progress, isComplete: collected >= target && target > 0,
+    status: plan.status || 'active', finalOrderId: plan.finalOrderId || null,
+    createdAt: plan.createdAt || null, updatedAt: plan.updatedAt || null, completedAt: plan.completedAt || null,
+    contributions,
+  };
+}
+
+function tryFinalizePromotionSavingsPlan(planIdInput) {
+  return runPromotionSavingsSerialized(() => {
+    try {
+      const planId = normalizePositiveInt(planIdInput);
+      if (!planId) return { ok: false, reason: 'invalid_plan' };
+      const plansL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_FILE);
+      const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+      if (!plansL.ok || !paysL.ok) return { ok: false, reason: 'storage_unreadable' };
+      const plans = plansL.data; const payments = paysL.data;
+      const idx = plans.findIndex((p) => parseInt(p && p.planId, 10) === planId);
+      if (idx === -1) return { ok: false, reason: 'plan_not_found' };
+      const plan = plans[idx];
+      if (plan.finalOrderId || plan.status === 'completed') {
+        return { ok: true, reason: 'already_completed', finalOrderId: plan.finalOrderId || null };
+      }
+      const confirmedSum = roundMoney2(payments
+        .filter((p) => p && parseInt(p.planId, 10) === planId && p.paymentStatus === 'confirmed')
+        .reduce((s, p) => s + (Number(p.amount) || 0), 0));
+      const target = roundMoney2(plan.targetAmount || 0);
+      plans[idx] = { ...plan, collectedAmount: confirmedSum, remainingAmount: roundMoney2(Math.max(0, target - confirmedSum)), updatedAt: new Date().toISOString() };
+      // Ecriture critique: ne jamais signaler un succes si la persistence echoue.
+      if (target <= 0 || confirmedSum < target) {
+        try { fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8'); } catch (we) { console.error('savings finalize write error:', we && we.message); throw new Error('savings_write_error'); }
+        return { ok: false, reason: 'not_funded', collectedAmount: confirmedSum };
+      }
+      const orders = readJSONFile(ORDERS_FILE);
+      const arrOrders = Array.isArray(orders) ? orders : [];
+      const existing = arrOrders.find((o) => o && o.purchaseType === 'promotion_savings' && parseInt(o.planId, 10) === planId);
+      if (existing) {
+        // Idempotence: commande deja creee -> lier le plan (ne jamais creer une 2e commande).
+        plans[idx] = { ...plans[idx], collectedAmount: confirmedSum, remainingAmount: 0, status: 'completed', finalOrderId: existing.id, completedAt: plans[idx].completedAt || new Date().toISOString(), updatedAt: new Date().toISOString(), ...(plans[idx].goalNotifiedAt ? { goalNotifiedAt: plans[idx].goalNotifiedAt } : {}), ...(plans[idx].orderNotifiedAt ? { orderNotifiedAt: plans[idx].orderNotifiedAt } : {}) };
+        try { fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8'); } catch (we) { console.error('savings finalize write error:', we && we.message); throw new Error('savings_write_error'); }
+        return { ok: true, reason: 'existing_order_linked', finalOrderId: existing.id };
+      }
+      const promotions = readJSONFile(PROMOTIONS_FILE);
+      const promotion = Array.isArray(promotions) ? promotions.find((p) => parseInt(p && p.id, 10) === parseInt(plan.promotionId, 10)) : null;
+      if (!promotion) { try { fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8'); } catch (_) {} return { ok: false, reason: 'promotion_not_found' }; }
+      const users = readJSONFile(USERS_FILE);
+      const ownerId = parseInt(plan.userId, 10);
+      const owner = Array.isArray(users) ? users.find((u) => parseInt(u && u.id, 10) === ownerId) : null;
+      if (!owner) { try { fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8'); } catch (_) {} return { ok: false, reason: 'owner_not_found' }; }
+      // Re-verification idempotente juste avant creation (fenetre de concurrence JSON, mono-instance).
+      const ordersRe = readJSONFile(ORDERS_FILE);
+      const arrOrdersRe = Array.isArray(ordersRe) ? ordersRe : [];
+      const existingRe = arrOrdersRe.find((o) => o && o.purchaseType === 'promotion_savings' && parseInt(o.planId, 10) === planId);
+      if (existingRe) {
+        plans[idx] = { ...plans[idx], collectedAmount: confirmedSum, remainingAmount: 0, status: 'completed', finalOrderId: existingRe.id, completedAt: plans[idx].completedAt || new Date().toISOString(), updatedAt: new Date().toISOString(), ...(plans[idx].goalNotifiedAt ? { goalNotifiedAt: plans[idx].goalNotifiedAt } : {}), ...(plans[idx].orderNotifiedAt ? { orderNotifiedAt: plans[idx].orderNotifiedAt } : {}) };
+        try { fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8'); } catch (we) { console.error('savings finalize write error:', we && we.message); throw new Error('savings_write_error'); }
+        return { ok: true, reason: 'existing_order_linked', finalOrderId: existingRe.id };
+      }
+      const adminUser = Array.isArray(users) ? users.find((u) => u.role === 'admin') : null;
+      const seller = adminUser?.id || promotion.vendeur || null;
+      const itemPrice = roundMoney2(target);
+      const validatedItems = [{ id: promotion.id, price: itemPrice, seller, name: promotion.name, image: promotion.image, categorie: promotion.categorie, vendeurNom: 'Djassa CI', vendeurCompte: '', quantite: 1 }];
+      const subtotal = itemPrice; const commission = roundMoney2(subtotal * 0.05); const total = roundMoney2(subtotal + commission);
+      let finalOrderId = Date.now(); let idTry = 0;
+      while (arrOrdersRe.some((o) => o && parseInt(o.id, 10) === finalOrderId) && idTry < 50) { finalOrderId = Date.now() + idTry + 1; idTry++; }
+      if (arrOrdersRe.some((o) => o && parseInt(o.id, 10) === finalOrderId)) throw new Error('savings_order_id_collision');
+      const nowIso = new Date().toISOString();
+      const confirmedRefs = payments.filter((p) => p && parseInt(p.planId, 10) === planId && p.paymentStatus === 'confirmed')
+        .map((p) => ({ paymentId: p.paymentId, transactionReference: p.transactionReference, amount: p.amount }));
+      arrOrdersRe.push({
+        id: finalOrderId, transaction_id: `SAVINGS-${planId}-${finalOrderId}`, utilisateurId: ownerId, seller,
+        articles: validatedItems, total, date: nowIso, statut: 'payÃ©e', statutVendeur: 'a_payer_vendeur',
+        methodePaiement: 'promotion_savings', numeroPaiement: owner.numero || owner.phone || '',
+        nomCompte: owner.nom || owner.name || owner.username || '',
+        nomLivraison: null, telLivraison: null, villeCommune: null, quartier: null, buyerLat: null, buyerLng: null,
+        purchaseType: 'promotion_savings', planId, promotionId: plan.promotionId,
+        savingsContributions: confirmedRefs, savingsCollectedAmount: confirmedSum, savingsTargetAmount: target,
+      });
+      // Ecriture commande critique: si elle echoue, ne JAMAIS marquer le plan complete.
+      let ordersWritten = false;
+      try { ordersWritten = (writeJSONFile(ORDERS_FILE, arrOrdersRe) !== false); } catch (oe) { console.error('savings finalize: order write threw:', oe && oe.message ? oe.message : oe); ordersWritten = false; }
+      if (!ordersWritten) { console.error('savings finalize: order write failed, plan kept non-completed'); throw new Error('savings_order_write_error'); }
+      // La commande finale est enregistree: marquer le plan complete. Si cette ecriture echoue, la commande reste source de verite et la prochaine tentative reliera via idempotence.
+      plans[idx] = { ...plans[idx], collectedAmount: confirmedSum, remainingAmount: 0, status: 'completed', finalOrderId, completedAt: nowIso, updatedAt: nowIso, goalNotifiedAt: plan.goalNotifiedAt || nowIso, orderNotifiedAt: plan.orderNotifiedAt || nowIso };
+      try { fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8'); } catch (we) { console.error('savings finalize: plan write failed after order written (idempotent link on retry):', we && we.message); throw new Error('savings_plan_write_error'); }
+      try { io.emit('payment_update', { orderId: String(finalOrderId), planId: String(planId), status: 'completed' }); } catch (_) {}
+      // Notifications (best-effort): garde persistée goalNotifiedAt/orderNotifiedAt (idempotence tryFinalize + relink). Ne jamais interrompre la finalisation.
+      if (!plan.goalNotifiedAt || !plan.orderNotifiedAt) {
+        try {
+          if (owner && owner.fcmToken) {
+            if (!plan.goalNotifiedAt) sendFcmToToken(owner.fcmToken,{title:"Objectif atteint",body:"Votre objectif d'épargne est atteint.",type:"savings_goal_reached",data:{planId:String(planId)}}).catch(()=>{});
+            if (!plan.orderNotifiedAt) {
+              sendFcmToToken(owner.fcmToken,{title:"Commande créée",body:`Commande #${finalOrderId} créée pour votre achat petit à petit.`,type:"savings_order_created",data:{planId:String(planId),orderId:String(finalOrderId)}}).catch(()=>{});
+              sendFcmToToken(owner.fcmToken,{title:"Achat petit a petit termine",body:`Objectif atteint ! Votre commande #${finalOrderId} a ete creee.`,type:"promotion_savings_completed",data:{orderId:String(finalOrderId),planId:String(planId)}}).catch(()=>{});
+            }
+          }
+        } catch (_) {}
+      }
+      return { ok: true, reason: 'completed', finalOrderId };
+    } catch (e) {
+      console.error('tryFinalizePromotionSavingsPlan error:', e && e.message ? e.message : e);
+      // Propager les erreurs de stockage/ecriture critiques pour que l'appelant (webhook) renvoie 500 (retriable). Idempotence/gardes preservent la surete.
+      if (e && typeof e.message === 'string' && (e.message === 'savings_storage_unreadable' || e.message.indexOf('savings_') === 0)) throw e;
+      return { ok: false, reason: 'error' };
+    }
+  });
+}
+
+app.post('/api/promotions/:promotionId/savings', authenticateToken, async (req, res) => {
+  try {
+    const promotionId = normalizePositiveInt(req.params.promotionId);
+    if (!promotionId) return res.status(400).json({ error: 'Identifiant promotion invalide' });
+    const userId = normalizePositiveInt(req.user && req.user.id);
+    if (!userId) return res.status(401).json({ error: 'Utilisateur non authentifie' });
+    const result = await runPromotionSavingsSerialized(() => {
+      try {
+        const promotions = readJSONFile(PROMOTIONS_FILE);
+        const promotion = Array.isArray(promotions) ? promotions.find((p) => parseInt(p && p.id, 10) === promotionId) : null;
+        if (!promotion) return { status: 404, body: { error: 'Promotion introuvable' } };
+        if (promotion.isActive === false) return { status: 400, body: { error: 'Promotion indisponible' } };
+        const targetAmount = computePromotionSavingsTargetServer(promotion);
+        if (!targetAmount || targetAmount <= 0) return { status: 400, body: { error: 'Prix promotionnel invalide' } };
+        const plansL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_FILE);
+        const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+        if (!plansL.ok || !paysL.ok) return { status: 500, body: { error: 'Stockage indisponible' } };
+        const plans = plansL.data; const payments = paysL.data;
+        let plan = plans.find((p) => p && parseInt(p.userId, 10) === userId && parseInt(p.promotionId, 10) === promotionId && p.status !== 'cancelled');
+        let created = false;
+        if (!plan) {
+          const existingIds = new Set(plans.map((p) => String(p && p.planId)));
+          let planId = Date.now(); let a = 0; while (existingIds.has(String(planId)) && a < 50) { planId = Date.now() + a + 1; a++; }
+          if (existingIds.has(String(planId))) return { status: 500, body: { error: 'Impossible de generer un identifiant unique' } };
+          const nowIso = new Date().toISOString();
+          plan = { planId, userId, promotionId, promotionName: promotion.name || null, targetAmount, collectedAmount: 0, remainingAmount: targetAmount, status: 'active', createdAt: nowIso, updatedAt: nowIso, completedAt: null, finalOrderId: null };
+          plans.push(plan);
+          fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8');
+          created = true;
+        }
+        // FCM (best-effort): plan créé seulement (pas à la relecture idempotente).
+        if (created) {
+          try {
+            const owner = (readJSONFile(USERS_FILE) || []).find((u) => parseInt(u && u.id, 10) === userId);
+            if (owner && owner.fcmToken) sendFcmToToken(owner.fcmToken, { title: 'Achat petit à petit', body: 'Votre objectif d\'épargne a été créé.', type: 'savings_plan_created', data: { planId: String(plan.planId), promotionId: String(promotionId) } }).catch(() => {});
+          } catch (_) {}
+        }
+        return { status: created ? 201 : 200, body: { success: true, created, plan: buildPromotionSavingsPlanView(plan, payments) } };
+      } catch (e) { console.error('POST promotion savings error:', e && e.message ? e.message : e); return { status: 500, body: { error: 'Server error' } }; }
+    });
+    return res.status(result.status).json(result.body);
+  } catch (error) { console.error('POST promotion savings outer error:', error); return res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/api/savings/:planId', authenticateToken, async (req, res) => {
+  try {
+    const planId = normalizePositiveInt(req.params.planId);
+    if (!planId) return res.status(400).json({ error: 'Identifiant objectif invalide' });
+    const userId = normalizePositiveInt(req.user && req.user.id);
+    if (!userId) return res.status(401).json({ error: 'Utilisateur non authentifie' });
+    const plansL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_FILE);
+    const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+    if (!plansL.ok || !paysL.ok) return res.status(500).json({ error: 'Stockage indisponible' });
+    const plan = plansL.data.find((p) => p && parseInt(p.planId, 10) === planId);
+    if (!plan) return res.status(404).json({ error: 'Objectif introuvable' });
+    if (parseInt(plan.userId, 10) !== userId) return res.status(403).json({ error: 'Acces refuse' });
+    return res.json({ success: true, plan: buildPromotionSavingsPlanView(plan, paysL.data) });
+  } catch (error) { console.error('GET savings plan error:', error); return res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/savings/:planId/contributions/init', authenticateToken, async (req, res) => {
+  let paymentId = null;
+  try {
+    const planId = normalizePositiveInt(req.params.planId);
+    if (!planId) return res.status(400).json({ error: 'Identifiant objectif invalide' });
+    const userId = normalizePositiveInt(req.user && req.user.id);
+    if (!userId) return res.status(401).json({ error: 'Utilisateur non authentifie' });
+    const rawAmount = req.body && req.body.amount;
+    const amount = typeof rawAmount === 'number' ? rawAmount : Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'Montant de contribution invalide' });
+    const amountR = roundMoney2(amount);
+    if (amountR <= 0) return res.status(400).json({ error: 'Montant de contribution invalide' });
+
+    const initRes = await runPromotionSavingsSerialized(() => {
+      try {
+        const plansL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_FILE);
+        const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
+        if (!plansL.ok || !paysL.ok) return { status: 500, body: { error: 'Stockage indisponible' } };
+        const plans = plansL.data; const payments = paysL.data;
+        const pIdx = plans.findIndex((p) => p && parseInt(p.planId, 10) === planId);
+        if (pIdx === -1) return { status: 404, body: { error: 'Objectif introuvable' } };
+        const plan = plans[pIdx];
+        if (parseInt(plan.userId, 10) !== userId) return { status: 403, body: { error: 'Acces refuse' } };
+        if (plan.status === 'completed' || plan.finalOrderId) return { status: 400, body: { error: 'Objectif deja atteint' } };
+        if (plan.status === 'cancelled') return { status: 400, body: { error: 'Objectif indisponible' } };
+        const promotions = readJSONFile(PROMOTIONS_FILE);
+        const promotion = Array.isArray(promotions) ? promotions.find((p) => parseInt(p && p.id, 10) === parseInt(plan.promotionId, 10)) : null;
+        if (!promotion) return { status: 400, body: { error: 'Promotion associee introuvable' } };
+        const planPayments = payments.filter((p) => p && parseInt(p.planId, 10) === planId);
+        const confirmedSum = roundMoney2(planPayments.filter((p) => p.paymentStatus === 'confirmed').reduce((s, p) => s + (Number(p.amount) || 0), 0));
+        const reservedSum = roundMoney2(planPayments.filter((p) => p.paymentStatus === 'pending' || p.paymentStatus === 'initializing').reduce((s, p) => s + (Number(p.amount) || 0), 0));
+        const target = roundMoney2(plan.targetAmount || 0);
+        const reservedRemaining = roundMoney2(Math.max(0, target - confirmedSum - reservedSum));
+        if (reservedRemaining <= 0) return { status: 400, body: { error: 'L\'objectif est deja atteint ou entierement reserve' } };
+        if (amountR > reservedRemaining) return { status: 400, body: { error: 'Montant superieur au montant restant disponible', remainingAmount: reservedRemaining } };
+        const existingIds = new Set(planPayments.map((p) => String(p.paymentId)));
+        paymentId = Date.now(); let a = 0; while (existingIds.has(String(paymentId)) && a < 50) { paymentId = Date.now() + a + 1; a++; }
+        if (existingIds.has(String(paymentId))) { paymentId = null; return { status: 500, body: { error: 'Impossible de generer un identifiant unique' } }; }
+        const nowIso = new Date().toISOString();
+        payments.push({ paymentId, planId, userId, promotionId: plan.promotionId, amount: amountR, transactionReference: null, paymentStatus: 'initializing', provider: 'geniuspay', createdAt: nowIso, updatedAt: nowIso, confirmedAt: null, failedAt: null });
+        fs.writeFileSync(PROMOTION_SAVINGS_PAYMENTS_FILE, JSON.stringify(payments, null, 2), 'utf8');
+        plans[pIdx] = { ...plan, collectedAmount: confirmedSum, remainingAmount: roundMoney2(Math.max(0, target - confirmedSum)), updatedAt: nowIso };
+        fs.writeFileSync(PROMOTION_SAVINGS_FILE, JSON.stringify(plans, null, 2), 'utf8');
+        const users = readJSONFile(USERS_FILE);
+        const user = Array.isArray(users) ? users.find((u) => parseInt(u && u.id, 10) === userId) : null;
+        return { ok: true, plan, user, amountR };
+      } catch (e) { console.error('savings init reserve error:', e && e.message ? e.message : e); return { status: 500, body: { error: 'Server error' } }; }
+    });
+    if (!initRes || !initRes.ok) return res.status((initRes && initRes.status) || 500).json((initRes && initRes.body) || { error: 'Server error' });
+
+    const { plan, user } = initRes;
+    const customerName = (user && (user.nom || user.name || user.username)) || `Utilisateur ${userId}`;
+    const rawPhone = (user && (user.numero || user.phone || user.telephone)) || (req.body && req.body.phone) || '';
+    const phone = String(rawPhone || '').trim();
+    const payload = {
+      amount: amountR, description: `Achat petit a petit promo ${plan.promotionId} - plan ${planId}`,
+      customer: { name: customerName, phone: phone.startsWith('+') ? phone : (phone ? `+225${phone}` : '') },
+      metadata: { payment_type: 'promotion_savings_contribution', plan_id: String(planId), contribution_id: String(paymentId), user_id: String(userId), promotion_id: String(plan.promotionId) },
+    };
+    let response, data = null;
+    try {
+      response = await fetch('https://geniuspay.ci/api/v1/merchant/payments', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': GENIUSPAY_API_KEY, 'X-API-Secret': GENIUSPAY_SECRET_KEY }, body: JSON.stringify(payload) });
+      data = await response.json().catch(() => null);
+    } catch (fetchError) {
+      // Aucun checkout_url/reference exploitable obtenu (erreur reseau) -> marquer failed pour liberer la reservation. Ecriture verifiee; si incertaine, on signale l'echec sans mentir sur l'etat.
+      let mark = { ok: false };
+      try { mark = await runPromotionSavingsSerialized(() => markSavingsContributionFailedIfInitializing(paymentId, 'provider_fetch_error')); } catch (_) {}
+      if (!mark || !mark.ok) console.error('savings init: unable to persist failed state after fetch error', paymentId);
+      return res.status(502).json({ error: 'Echec d\'initialisation du paiement GeniusPay' });
+    }
+    if (!response || !response.ok || !data || data.success === false) {
+      // Reponse provider rejetee (pas de paiement confirme) -> marquer failed pour liberer la reservation.
+      let mark = { ok: false };
+      try { mark = await runPromotionSavingsSerialized(() => markSavingsContributionFailedIfInitializing(paymentId, 'provider_rejected')); } catch (_) {}
+      if (!mark || !mark.ok) console.error('savings init: unable to persist failed state after provider rejection', paymentId);
+      return res.status(502).json({ error: 'Echec d\'initialisation du paiement GeniusPay' });
+    }
+    const checkoutUrl = data && data.data && data.data.checkout_url;
+    const reference = data && data.data && data.data.reference;
+    if (typeof checkoutUrl !== 'string' || !checkoutUrl.trim() || reference == null || String(reference).trim() === '') {
+      // Reponse invalide (pas de checkout_url/reference) -> pas de paiement initiable cote client; marquer failed.
+      let mark = { ok: false };
+      try { mark = await runPromotionSavingsSerialized(() => markSavingsContributionFailedIfInitializing(paymentId, 'invalid_provider_response')); } catch (_) {}
+      if (!mark || !mark.ok) console.error('savings init: unable to persist failed state after invalid provider response', paymentId);
+      return res.status(502).json({ error: 'Reponse GeniusPay invalide (checkout_url/reference manquants)' });
+    }
+    // Reference/checkout valides recus: passage pending CRITIQUE. Ne JAMAIS marquer failed si cette ecriture echoue (un paiement peut etre effectue avec cette reference).
+    let pendingRes = null;
+    try { pendingRes = await runPromotionSavingsSerialized(() => markSavingsContributionPending(paymentId, String(reference).trim(), checkoutUrl)); } catch (pe) { pendingRes = { ok: false, error: pe && pe.message ? pe.message : 'write_error' }; }
+    if (!pendingRes || !pendingRes.ok) {
+      console.error('savings init: pending write failed after valid provider response (do NOT mark failed; reference may be payable)', paymentId, pendingRes && pendingRes.error);
+      return res.status(500).json({ error: 'Paiement initialise chez GeniusPay mais enregistrement local incertain. Ne renvoyez pas de paiement; contactez le support avec la reference.', reference: String(reference).trim(), contribution: { paymentId, planId, userId, amount: amountR, paymentStatus: 'initializing' } });
+    }
+    // FCM (best-effort, après init réussie): contribution initiée, en attente webhook.
+    try { if (owner && owner.fcmToken) sendFcmToToken(owner.fcmToken, { title: "Versement initie", body: "Votre paiement est en attente de confirmation.", type: 'savings_contribution_initiated', data: { planId: String(planId), contributionId: String(paymentId) } }).catch(() => {}); } catch (_) {}
+    return res.json({ success: true, checkout_url: checkoutUrl, reference: String(reference).trim(), contribution: { paymentId, planId, userId, amount: amountR, paymentStatus: 'pending' } });
+  } catch (error) {
+    console.error('Promotion savings contribution init error:', error);
+    // Erreur inattendue: ne marquer failed que si l'ecriture confirme (et seulement depuis initializing). Ne pas convertir en echec confirme sans preuve.
+    try {
+      if (paymentId != null) {
+        const mark = await runPromotionSavingsSerialized(() => markSavingsContributionFailedIfInitializing(paymentId, 'unexpected_error'));
+        if (!mark || !mark.ok) console.error('savings init: unable to persist failed state after unexpected error', paymentId);
       }
     } catch (_) {}
     return res.status(500).json({ error: 'Server error' });
