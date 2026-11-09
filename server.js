@@ -2705,6 +2705,327 @@ app.get('/api/stats', authenticateToken, requireAdmin, (req, res) => {
   }
 });
 
+// ADMIN (lecture seule): tous les achats en équipe — données réelles, contributions confirmées uniquement pour la progression.
+app.get('/api/admin/teams', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const teams = Array.isArray(readJSONFile(TEAM_PURCHASES_FILE)) ? readJSONFile(TEAM_PURCHASES_FILE) : [];
+    const payments = Array.isArray(readJSONFile(TEAM_PAYMENTS_FILE)) ? readJSONFile(TEAM_PAYMENTS_FILE) : [];
+    const promotions = Array.isArray(readJSONFile(PROMOTIONS_FILE)) ? readJSONFile(PROMOTIONS_FILE) : [];
+    const products = Array.isArray(readJSONFile(PRODUCTS_FILE)) ? readJSONFile(PRODUCTS_FILE) : [];
+    const users = Array.isArray(readJSONFile(USERS_FILE)) ? readJSONFile(USERS_FILE) : [];
+
+    const confirmedByTeam = Object.create(null);
+    const confirmedByTeamUser = Object.create(null);
+    payments.forEach((p) => {
+      if (!p || p.paymentStatus !== 'confirmed') return;
+      const tid = parseInt(p.teamId, 10);
+      if (!Number.isFinite(tid) || tid <= 0) return;
+      const amt = Number(p.amount);
+      if (!Number.isFinite(amt)) return;
+      confirmedByTeam[tid] = (Number(confirmedByTeam[tid]) || 0) + amt;
+      const uid = parseInt(p.participantId != null ? p.participantId : p.userId, 10);
+      if (Number.isFinite(uid) && uid > 0) {
+        const k = tid + ':' + uid;
+        confirmedByTeamUser[k] = (Number(confirmedByTeamUser[k]) || 0) + amt;
+      }
+    });
+
+    const promoById = new Map(promotions.map((p) => [parseInt(p && p.id, 10), p]));
+    const productById = new Map(products.map((p) => [parseInt(p && p.id, 10), p]));
+    const userById = new Map(users.map((u) => [parseInt(u && u.id, 10), u]));
+    const safeUserName = (id) => {
+      const uid = parseInt(id, 10);
+      if (!Number.isFinite(uid) || uid <= 0) return null;
+      const u = userById.get(uid);
+      if (!u) return null;
+      const full = [u.prenom, u.nom].filter((v) => v != null && String(v).trim() !== '').join(' ').trim();
+      return full || (u.username != null ? String(u.username) : null) || (u.numero != null ? String(u.numero) : null) || (u.phone != null ? String(u.phone) : null) || null;
+    };
+
+    const items = teams.map((team) => {
+      const tid = parseInt(team && team.teamId, 10);
+      const target = Number(team && team.teamAmount != null ? team.teamAmount : (team && team.targetAmount));
+      const targetAmount = Number.isFinite(target) && target >= 0 ? target : (Number.isFinite(Number(team && team.targetAmount)) ? Number(team.targetAmount) : null);
+      // Progression: contributions CONFIRMÉES uniquement (réelles, team_payments). pending/initializing/failed exclus.
+      const collectedAmount = roundMoney2(Number(confirmedByTeam[tid]) || 0);
+      const remainingAmount = (targetAmount != null) ? roundMoney2(Math.max(0, targetAmount - collectedAmount)) : null;
+      let progressPercent = null;
+      if (targetAmount != null) {
+        progressPercent = targetAmount > 0 ? Math.min(100, Math.max(0, (collectedAmount / targetAmount) * 100)) : 0;
+      }
+      const status = typeof effectiveTeamStatus === 'function' ? effectiveTeamStatus(team) : (team && team.status ? team.status : null);
+      const promo = promoById.get(parseInt(team && team.promotionId, 10));
+      const prod = promo ? (productById.get(parseInt(promo.productId, 10)) || productById.get(parseInt(promo.id, 10))) : null;
+      const productName = (promo && (promo.name || promo.title)) ? String(promo.name || promo.title) : (prod && (prod.name || prod.title) ? String(prod.name || prod.title) : null);
+      const productImage = (promo && (promo.image || promo.imageUrl)) ? String(promo.image || promo.imageUrl) : (prod && (prod.image || prod.imageUrl) ? String(prod.image || prod.imageUrl) : null);
+      const participantsRaw = Array.isArray(team && team.participants) ? team.participants : [];
+      const participants = participantsRaw.map((p) => {
+        const uid = parseInt(p && p.userId, 10);
+        const paid = confirmedByTeamUser[tid + ':' + uid];
+        return {
+          userId: Number.isFinite(uid) ? uid : null,
+          name: safeUserName(uid),
+          joinedAt: p && p.joinedAt ? p.joinedAt : null,
+          confirmedAmountPaid: paid != null ? roundMoney2(paid) : 0,
+        };
+      });
+      return {
+        teamId: Number.isFinite(tid) ? tid : null,
+        productName,
+        productImage,
+        creatorId: team && team.creatorId != null ? parseInt(team.creatorId, 10) : null,
+        creatorName: safeUserName(team && team.creatorId),
+        targetAmount,
+        collectedAmount,
+        remainingAmount,
+        progressPercent,
+        participantsCount: participants.length,
+        participants,
+        createdAt: team && team.createdAt ? team.createdAt : null,
+        expiresAt: team && team.expiresAt ? team.expiresAt : null,
+        status,
+        finalOrderId: team && team.finalOrderId != null ? team.finalOrderId : null,
+      };
+    }).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+    return res.json({ items, count: items.length });
+  } catch (error) {
+    console.error('Admin teams error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ADMIN (lecture seule): tous les achats petit à petit — contributions confirmées uniquement pour la progression.
+app.get('/api/admin/savings', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const plans = Array.isArray(readJSONFile(PROMOTION_SAVINGS_FILE)) ? readJSONFile(PROMOTION_SAVINGS_FILE) : [];
+    const payments = Array.isArray(readJSONFile(PROMOTION_SAVINGS_PAYMENTS_FILE)) ? readJSONFile(PROMOTION_SAVINGS_PAYMENTS_FILE) : [];
+    const promotions = Array.isArray(readJSONFile(PROMOTIONS_FILE)) ? readJSONFile(PROMOTIONS_FILE) : [];
+    const products = Array.isArray(readJSONFile(PRODUCTS_FILE)) ? readJSONFile(PRODUCTS_FILE) : [];
+    const users = Array.isArray(readJSONFile(USERS_FILE)) ? readJSONFile(USERS_FILE) : [];
+
+    const promoById = new Map(promotions.map((p) => [parseInt(p && p.id, 10), p]));
+    const productById = new Map(products.map((p) => [parseInt(p && p.id, 10), p]));
+    const userById = new Map(users.map((u) => [parseInt(u && u.id, 10), u]));
+    const safeUserName = (id) => {
+      const uid = parseInt(id, 10);
+      if (!Number.isFinite(uid) || uid <= 0) return null;
+      const u = userById.get(uid);
+      if (!u) return null;
+      const full = [u.prenom, u.nom].filter((v) => v != null && String(v).trim() !== '').join(' ').trim();
+      return full || (u.username != null ? String(u.username) : null) || (u.numero != null ? String(u.numero) : null) || (u.phone != null ? String(u.phone) : null) || null;
+    };
+
+    const items = plans.map((plan) => {
+      // Réutilise la vue existante: collectedAmount/progress calculés depuis contributions CONFIRMÉES uniquement.
+      const view = buildPromotionSavingsPlanView(plan, payments);
+      const contributions = Array.isArray(view.contributions) ? view.contributions : [];
+      const promo = promoById.get(parseInt((plan && plan.promotionId) != null ? plan.promotionId : view.promotionId, 10));
+      const prod = promo ? (productById.get(parseInt(promo.productId, 10)) || productById.get(parseInt(promo.id, 10))) : null;
+      const productName = (promo && (promo.name || promo.title)) ? String(promo.name || promo.title)
+        : (plan && plan.promotionName ? String(plan.promotionName) : (view.promotionName ? String(view.promotionName) : (prod && (prod.name || prod.title) ? String(prod.name || prod.title) : null)));
+      const productImage = (promo && (promo.image || promo.imageUrl)) ? String(promo.image || promo.imageUrl)
+        : (prod && (prod.image || prod.imageUrl) ? String(prod.image || prod.imageUrl) : null);
+      const targetAmount = Number.isFinite(Number(view.targetAmount)) ? Number(view.targetAmount) : null;
+      const collectedAmount = Number.isFinite(Number(view.collectedAmount)) ? Number(view.collectedAmount) : null;
+      const progressPercent = (targetAmount != null && collectedAmount != null)
+        ? Math.min(100, Math.max(0, targetAmount > 0 ? (collectedAmount / targetAmount) * 100 : 0))
+        : (Number.isFinite(Number(view.progress)) ? Math.min(100, Math.max(0, Number(view.progress) * 100)) : null);
+      return {
+        planId: view.planId != null ? view.planId : (plan && plan.planId != null ? plan.planId : null),
+        productName,
+        productImage,
+        buyerId: view.userId != null ? view.userId : (plan && plan.userId != null ? plan.userId : null),
+        buyerName: safeUserName(view.userId != null ? view.userId : (plan && plan.userId)),
+        targetAmount,
+        savedAmount: collectedAmount,
+        collectedAmount,
+        remainingAmount: Number.isFinite(Number(view.remainingAmount)) ? Number(view.remainingAmount) : null,
+        progressPercent,
+        contributionsCount: contributions.length,
+        contributions,
+        createdAt: view.createdAt || (plan && plan.createdAt) || null,
+        updatedAt: view.updatedAt || (plan && plan.updatedAt) || null,
+        completedAt: view.completedAt || (plan && plan.completedAt) || null,
+        status: view.status || (plan && plan.status) || null,
+        finalOrderId: view.finalOrderId != null ? view.finalOrderId : (plan && plan.finalOrderId != null ? plan.finalOrderId : null),
+      };
+    }).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+    return res.json({ items, count: items.length });
+  } catch (error) {
+    console.error('Admin savings error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// UTILISATEUR (lecture seule): mes achats en équipe (créateur ou participant). Données réelles, contributions confirmées uniquement.
+app.get('/api/my/teams', authenticateToken, (req, res) => {
+  try {
+    const userId = parseInt(req.user && req.user.id, 10);
+    if (!Number.isFinite(userId) || userId <= 0) return res.status(401).json({ error: 'Utilisateur non authentifié' });
+
+    const teams = Array.isArray(readJSONFile(TEAM_PURCHASES_FILE)) ? readJSONFile(TEAM_PURCHASES_FILE) : [];
+    const myTeams = teams.filter((team) => {
+      if (!team) return false;
+      if (parseInt(team.creatorId, 10) === userId) return true;
+      const parts = Array.isArray(team.participants) ? team.participants : [];
+      return parts.some((p) => parseInt(p && p.userId, 10) === userId);
+    });
+
+    const payments = Array.isArray(readJSONFile(TEAM_PAYMENTS_FILE)) ? readJSONFile(TEAM_PAYMENTS_FILE) : [];
+    const promotions = Array.isArray(readJSONFile(PROMOTIONS_FILE)) ? readJSONFile(PROMOTIONS_FILE) : [];
+    const products = Array.isArray(readJSONFile(PRODUCTS_FILE)) ? readJSONFile(PRODUCTS_FILE) : [];
+    const users = Array.isArray(readJSONFile(USERS_FILE)) ? readJSONFile(USERS_FILE) : [];
+
+    const confirmedByTeam = Object.create(null);
+    const confirmedByTeamUser = Object.create(null);
+    payments.forEach((p) => {
+      if (!p || p.paymentStatus !== 'confirmed') return;
+      const tid = parseInt(p.teamId, 10);
+      if (!Number.isFinite(tid) || tid <= 0) return;
+      const amt = Number(p.amount);
+      if (!Number.isFinite(amt)) return;
+      confirmedByTeam[tid] = (Number(confirmedByTeam[tid]) || 0) + amt;
+      const uid = parseInt(p.participantId != null ? p.participantId : p.userId, 10);
+      if (Number.isFinite(uid) && uid > 0) {
+        const k = tid + ':' + uid;
+        confirmedByTeamUser[k] = (Number(confirmedByTeamUser[k]) || 0) + amt;
+      }
+    });
+
+    const promoById = new Map(promotions.map((p) => [parseInt(p && p.id, 10), p]));
+    const productById = new Map(products.map((p) => [parseInt(p && p.id, 10), p]));
+    const userById = new Map(users.map((u) => [parseInt(u && u.id, 10), u]));
+    const safeUserName = (id) => {
+      const uid = parseInt(id, 10);
+      if (!Number.isFinite(uid) || uid <= 0) return null;
+      const u = userById.get(uid);
+      if (!u) return null;
+      const full = [u.prenom, u.nom].filter((v) => v != null && String(v).trim() !== '').join(' ').trim();
+      return full || (u.username != null ? String(u.username) : null) || (u.numero != null ? String(u.numero) : null) || (u.phone != null ? String(u.phone) : null) || null;
+    };
+
+    const items = myTeams.map((team) => {
+      const tid = parseInt(team && team.teamId, 10);
+      const target = Number(team && team.teamAmount != null ? team.teamAmount : (team && team.targetAmount));
+      const targetAmount = Number.isFinite(target) && target >= 0 ? target : (Number.isFinite(Number(team && team.targetAmount)) ? Number(team.targetAmount) : null);
+      const collectedAmount = roundMoney2(Number(confirmedByTeam[tid]) || 0);
+      const remainingAmount = (targetAmount != null) ? roundMoney2(Math.max(0, targetAmount - collectedAmount)) : null;
+      let progressPercent = null;
+      let progress = null;
+      if (targetAmount != null) {
+        progress = targetAmount > 0 ? Math.min(1, Math.max(0, collectedAmount / targetAmount)) : 0;
+        progressPercent = Math.min(100, Math.max(0, progress * 100));
+      }
+      const status = typeof effectiveTeamStatus === 'function' ? effectiveTeamStatus(team) : (team && team.status ? team.status : null);
+      const promo = promoById.get(parseInt(team && team.promotionId, 10));
+      const prod = promo ? (productById.get(parseInt(promo.productId, 10)) || productById.get(parseInt(promo.id, 10))) : null;
+      const productName = (promo && (promo.name || promo.title)) ? String(promo.name || promo.title) : (prod && (prod.name || prod.title) ? String(prod.name || prod.title) : null);
+      const productImage = (promo && (promo.image || promo.imageUrl)) ? String(promo.image || promo.imageUrl) : (prod && (prod.image || prod.imageUrl) ? String(prod.image || prod.imageUrl) : null);
+      const participantsRaw = Array.isArray(team && team.participants) ? team.participants : [];
+      const participants = participantsRaw.map((p) => {
+        const uid = parseInt(p && p.userId, 10);
+        const paid = confirmedByTeamUser[tid + ':' + uid];
+        return {
+          userId: Number.isFinite(uid) ? uid : null,
+          name: safeUserName(uid),
+          joinedAt: p && p.joinedAt ? p.joinedAt : null,
+          confirmedAmountPaid: paid != null ? roundMoney2(paid) : 0,
+        };
+      });
+      const isComplete = targetAmount != null ? (collectedAmount >= targetAmount && targetAmount > 0) : (status === 'completed' || team.finalOrderId != null);
+      return {
+        teamId: Number.isFinite(tid) ? tid : null,
+        promotionId: team && team.promotionId != null ? parseInt(team.promotionId, 10) : null,
+        productName,
+        productImage,
+        creatorId: team && team.creatorId != null ? parseInt(team.creatorId, 10) : null,
+        creatorName: safeUserName(team && team.creatorId),
+        targetAmount,
+        collectedAmount,
+        remainingAmount,
+        progress,
+        progressPercent,
+        participantsCount: participants.length,
+        participants,
+        createdAt: team && team.createdAt ? team.createdAt : null,
+        expiresAt: team && team.expiresAt ? team.expiresAt : null,
+        status,
+        finalOrderId: team && team.finalOrderId != null ? team.finalOrderId : null,
+        isComplete: !!isComplete,
+      };
+    }).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+    return res.json({ items, count: items.length });
+  } catch (error) {
+    console.error('My teams error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// UTILISATEUR (lecture seule): mes achats petit à petit (propriétaire uniquement).
+app.get('/api/my/savings', authenticateToken, (req, res) => {
+  try {
+    const userId = parseInt(req.user && req.user.id, 10);
+    if (!Number.isFinite(userId) || userId <= 0) return res.status(401).json({ error: 'Utilisateur non authentifié' });
+
+    const plans = Array.isArray(readJSONFile(PROMOTION_SAVINGS_FILE)) ? readJSONFile(PROMOTION_SAVINGS_FILE) : [];
+    const myPlans = plans.filter((plan) => plan && parseInt(plan.userId, 10) === userId);
+    const payments = Array.isArray(readJSONFile(PROMOTION_SAVINGS_PAYMENTS_FILE)) ? readJSONFile(PROMOTION_SAVINGS_PAYMENTS_FILE) : [];
+    const promotions = Array.isArray(readJSONFile(PROMOTIONS_FILE)) ? readJSONFile(PROMOTIONS_FILE) : [];
+    const products = Array.isArray(readJSONFile(PRODUCTS_FILE)) ? readJSONFile(PRODUCTS_FILE) : [];
+
+    const promoById = new Map(promotions.map((p) => [parseInt(p && p.id, 10), p]));
+    const productById = new Map(products.map((p) => [parseInt(p && p.id, 10), p]));
+
+    const items = myPlans.map((plan) => {
+      const view = buildPromotionSavingsPlanView(plan, payments);
+      const contributions = Array.isArray(view.contributions) ? view.contributions : [];
+      const promo = promoById.get(parseInt((plan && plan.promotionId) != null ? plan.promotionId : view.promotionId, 10));
+      const prod = promo ? (productById.get(parseInt(promo.productId, 10)) || productById.get(parseInt(promo.id, 10))) : null;
+      const productName = (promo && (promo.name || promo.title)) ? String(promo.name || promo.title)
+        : (plan && plan.promotionName ? String(plan.promotionName) : (view.promotionName ? String(view.promotionName) : (prod && (prod.name || prod.title) ? String(prod.name || prod.title) : null)));
+      const productImage = (promo && (promo.image || promo.imageUrl)) ? String(promo.image || promo.imageUrl)
+        : (prod && (prod.image || prod.imageUrl) ? String(prod.image || prod.imageUrl) : null);
+      const targetAmount = Number.isFinite(Number(view.targetAmount)) ? Number(view.targetAmount) : null;
+      const collectedAmount = Number.isFinite(Number(view.collectedAmount)) ? Number(view.collectedAmount) : null;
+      const progressPercent = (targetAmount != null && collectedAmount != null)
+        ? Math.min(100, Math.max(0, targetAmount > 0 ? (collectedAmount / targetAmount) * 100 : 0))
+        : (Number.isFinite(Number(view.progress)) ? Math.min(100, Math.max(0, Number(view.progress) * 100)) : null);
+      let lastContributionAt = null;
+      contributions.forEach((c) => {
+        const d = c && (c.confirmedAt || c.createdAt || c.updatedAt);
+        if (d && (!lastContributionAt || String(d) > String(lastContributionAt))) lastContributionAt = d;
+      });
+      return {
+        planId: view.planId != null ? view.planId : (plan && plan.planId != null ? plan.planId : null),
+        promotionId: (plan && plan.promotionId != null ? plan.promotionId : (view.promotionId != null ? view.promotionId : null)),
+        productName,
+        productImage,
+        targetAmount,
+        savedAmount: collectedAmount,
+        collectedAmount,
+        remainingAmount: Number.isFinite(Number(view.remainingAmount)) ? Number(view.remainingAmount) : null,
+        progress: Number.isFinite(Number(view.progress)) ? Math.min(1, Math.max(0, Number(view.progress))) : (targetAmount != null && collectedAmount != null && targetAmount > 0 ? Math.min(1, Math.max(0, collectedAmount / targetAmount)) : null),
+        progressPercent,
+        contributionsCount: contributions.length,
+        contributions,
+        createdAt: view.createdAt || (plan && plan.createdAt) || null,
+        lastContributionAt,
+        status: view.status || (plan && plan.status) || null,
+        finalOrderId: view.finalOrderId != null ? view.finalOrderId : (plan && plan.finalOrderId != null ? plan.finalOrderId : null),
+        isComplete: view.isComplete === true || view.status === 'completed' || view.finalOrderId != null,
+      };
+    }).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+    return res.json({ items, count: items.length });
+  } catch (error) {
+    console.error('My savings error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // HEALTH CHECK
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Djassa CI API is running', timestamp: new Date().toISOString() });
