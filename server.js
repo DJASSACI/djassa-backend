@@ -521,6 +521,10 @@ const initializeData = () => {
   if (!fs.existsSync(PROMOTION_SAVINGS_PAYMENTS_FILE)) {
     writeJSONFile(PROMOTION_SAVINGS_PAYMENTS_FILE, []);
   }
+  // Dédup webhooks GeniusPay (persistant) : init idempotente, ne jamais écraser un fichier existant.
+  if (!fs.existsSync(WEBHOOK_EVENTS_FILE)) {
+    try { fs.writeFileSync(WEBHOOK_EVENTS_FILE, JSON.stringify([], null, 2), 'utf8'); } catch (e) { console.error('Init WEBHOOK_EVENTS_FILE error:', e && e.message ? e.message : e); }
+  }
 };
 
 initializeData();
@@ -2755,7 +2759,8 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
     return res.sendStatus(200);
   }
 
-  // Si processing ancien (> 5 min), on autorise la reprise
+  // processing frais (< 5 min): 200 sans retraiter pour éviter une double exécution cross-instance
+  // (limite JSON/multi-instance Render: pas de verrou distribué). Un échec est marqué 'failed' (retriable).
   const STALE_MS = 5 * 60 * 1000;
   if (existing && existing.status === 'processing' && Date.now() - (existing.updatedAt || 0) < STALE_MS) {
     return res.sendStatus(200);
@@ -2832,7 +2837,8 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                     updatedAt: nowIso,
                     transactionReference: contribution.transactionReference, // conserver
                   };
-                  writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  const _wTeamPay = await writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  if (_wTeamPay === false) throw new Error('team_contribution_payment_write_error');
                   // FCM (best-effort, transition réelle -> confirmed uniquement): participant + créateur.
                   try {
                     const _teamUsers = readJSONFile(USERS_FILE) || [];
@@ -2842,19 +2848,20 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                     if (_creU && _creU.fcmToken && parseInt(_creU.id,10)!==parseInt(_partU&&_partU.id,10)) sendFcmToToken(_creU.fcmToken,{title:"Contribution confirmée",body:"Une contribution a été confirmée dans votre équipe.",type:"team_contribution_confirmed",data:{teamId:String(teamIdMeta),contributionId:String(contribution.paymentId||contributionIdMeta)}}).catch(()=>{});
                   } catch (_) {}
 
-                  // Recalculer collectedAmount UNIQUEMENT depuis contributions confirmées
-                  const paymentsAfter = readJSONFile(TEAM_PAYMENTS_FILE);
-                  const arrAfter = Array.isArray(paymentsAfter) ? paymentsAfter : [];
-                  const confirmedSum = arrAfter
+                  // Recalculer collectedAmount UNIQUEMENT depuis contributions confirmées (mémoire, évite race lecture/écriture async)
+                  const confirmedSum = allPayments
                     .filter((p) => p && parseInt(p.teamId, 10) === teamIdMeta && p.paymentStatus === 'confirmed')
                     .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
                   const teamsAfter = readJSONFile(TEAM_PURCHASES_FILE);
                   const taIdx = Array.isArray(teamsAfter) ? teamsAfter.findIndex((t) => parseInt(t.teamId, 10) === teamIdMeta) : -1;
                   if (taIdx !== -1) {
                     teamsAfter[taIdx] = { ...teamsAfter[taIdx], collectedAmount: confirmedSum };
-                    writeJSONFile(TEAM_PURCHASES_FILE, teamsAfter);
-                    // PHASE E: finalisation automatique si objectif atteint (idempotente)
-                    try { tryFinalizeTeamPurchase(teamIdMeta); } catch (_) {}
+                    const _wTeam = await writeJSONFile(TEAM_PURCHASES_FILE, teamsAfter);
+                    if (_wTeam === false) throw new Error('team_contribution_team_write_error');
+                    // Finalisation idempotente après confirmation (écritures critiques awaitées) :
+                    // - l'erreur remonte au webhook => HTTP 500 (jamais processed) => retry/reprise possible ;
+                    // - une contribution déjà confirmée n'est jamais réinitialisée.
+                    await tryFinalizeTeamPurchase(teamIdMeta);
                   }
                 } else {
                   console.warn('Team contribution webhook: état non confirmable', contribution.paymentStatus);
@@ -2871,7 +2878,8 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                     updatedAt: nowIso,
                     failureReason: 'provider_failed',
                   };
-                  writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  const _wTeamPayFail = await writeJSONFile(TEAM_PAYMENTS_FILE, allPayments);
+                  if (_wTeamPayFail === false) throw new Error('team_contribution_payment_write_error');
                   // FCM (best-effort, transition réelle -> failed uniquement, jamais si confirmed): participant.
                   try {
                     const _partU = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===parseInt(contribution.participantId,10));
@@ -2882,6 +2890,17 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
               }
             }
           }
+        }
+      }
+
+      // Reprise idempotente (sans nouveau paiement) : contribution déjà 'confirmed' mais équipe
+      // financée/non finalisée (échec finalisation précédent, webhook processed, etc.). Aucun
+      // changement de statut de paiement, aucune demande de paiement.
+      if (isSuccess && teamIdMeta && contributionIdMeta) {
+        const _pf = readJSONFile(TEAM_PAYMENTS_FILE);
+        const _cf = Array.isArray(_pf) ? _pf.find((p) => parseInt(p && p.paymentId, 10) === contributionIdMeta) : null;
+        if (_cf && _cf.paymentStatus === 'confirmed') {
+          await tryFinalizeTeamPurchase(teamIdMeta); // idempotent : no-op si non financée/déjà finalisée ; throw sur échec écriture critique => 500 retriable
         }
       }
     }
@@ -2900,7 +2919,7 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
           console.warn('Promotion savings webhook: identifiants/reference manquants');
         } else {
           const webhookAmountRawS = req.body.data && (req.body.data.amount ?? req.body.data.paid_amount ?? (req.body.data.payment && req.body.data.payment.amount));
-          const webhookAmountS = webhookAmountRawS != null ? Number(webhookAmountS) : null;
+          const webhookAmountS = webhookAmountRawS != null ? Number(webhookAmountRawS) : null;
           let savingsFinalizeTarget = null;
           await runPromotionSavingsSerialized(() => {
             try {
@@ -3076,6 +3095,22 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook processing error:', err && err.message ? err.message : err);
+    // Ne JAMAIS marquer processed sur erreur. Marquer 'failed' (retriable) pour ne pas laisser
+    // un 'processing' qui serait acquitté en 200 pendant la fenêtre stale.
+    try {
+      const errEvents = readJSONFile(WEBHOOK_EVENTS_FILE);
+      const arrErr = Array.isArray(errEvents) ? errEvents : [];
+      const ei = arrErr.findIndex((e) => e && e.key === dedupKey);
+      // Ne jamais rétrograder un événement déjà 'processed' en 'failed' (protection registre).
+      // Ne constitue PAS un verrou distribué cross-instance (JSON/multi-instance Render).
+      if (ei !== -1 && arrErr[ei] && arrErr[ei].status === 'processed') {
+        // no-op: conserver 'processed'
+      } else {
+        const errRecord = { key: dedupKey, status: 'failed', updatedAt: Date.now() };
+        if (ei !== -1) arrErr[ei] = { ...arrErr[ei], ...errRecord }; else arrErr.push(errRecord);
+        writeJSONFile(WEBHOOK_EVENTS_FILE, arrErr);
+      }
+    } catch (_) {}
     res.sendStatus(500);
   } finally {
     processingKeys.delete(dedupKey);
@@ -3458,7 +3493,7 @@ app.post('/api/teams', authenticateToken, (req, res) => {
 });
 
 // GET /api/teams/:id — consulter une équipe (infos + progression)
-app.get('/api/teams/:id', authenticateToken, (req, res) => {
+app.get('/api/teams/:id', authenticateToken, async (req, res) => {
   try {
     const teamId = parseInt(req.params.id, 10);
     if (!teamId || Number.isNaN(teamId)) {
@@ -3473,13 +3508,23 @@ app.get('/api/teams/:id', authenticateToken, (req, res) => {
 
     const team = teams[idx];
     const newStatus = effectiveTeamStatus(team);
+    let currentTeam = team;
     if (team.status !== newStatus && team.status !== 'completed' && team.status !== 'cancelled') {
       teams[idx] = { ...team, status: newStatus };
       writeJSONFile(TEAM_PURCHASES_FILE, teams);
-      return res.json({ team: buildTeamView(teams[idx]) });
+      currentTeam = teams[idx];
+    }
+    // Reprise idempotente lecture (best-effort, sans nouveau paiement) : si financée/non finalisée,
+    // tente de créer/relier la commande finale. Ne modifie jamais les contributions confirmées.
+    if (!currentTeam.finalOrderId && currentTeam.status !== 'completed') {
+      try { await tryFinalizeTeamPurchase(teamId); } catch (_) {}
+      const _t2 = readJSONFile(TEAM_PURCHASES_FILE);
+      const _i2 = Array.isArray(_t2) ? _t2.findIndex((t) => parseInt(t.teamId, 10) === teamId) : -1;
+      if (_i2 !== -1) currentTeam = _t2[_i2];
     }
 
-    return res.json({ team: buildTeamView(team) });
+    const view = buildTeamView(currentTeam);
+    return res.json({ team: view });
   } catch (error) {
     console.error('Get team error:', error);
     return res.status(500).json({ error: 'Server error' });
@@ -3660,7 +3705,7 @@ app.post('/api/teams/join-by-code', authenticateToken, (req, res) => {
 });
 
 // GET /api/teams/:id/status — progression d'une équipe (PHASE C)
-app.get('/api/teams/:id/status', authenticateToken, (req, res) => {
+app.get('/api/teams/:id/status', authenticateToken, async (req, res) => {
   try {
     const teamId = parseInt(req.params.id, 10);
     if (!teamId || Number.isNaN(teamId)) {
@@ -3682,8 +3727,16 @@ app.get('/api/teams/:id/status', authenticateToken, (req, res) => {
       currentTeam = teams[idx];
     }
 
+    // Reprise idempotente lecture (best-effort, sans nouveau paiement) : si financée/non finalisée.
+    if (!currentTeam.finalOrderId && currentTeam.status !== 'completed') {
+      try { await tryFinalizeTeamPurchase(teamId); } catch (_) {}
+      const _t2 = readJSONFile(TEAM_PURCHASES_FILE);
+      const _i2 = Array.isArray(_t2) ? _t2.findIndex((t) => parseInt(t.teamId, 10) === teamId) : -1;
+      if (_i2 !== -1) currentTeam = _t2[_i2];
+    }
+
     const view = buildTeamView(currentTeam);
-    // collectedAmount provient des paiements CONFIRMÉS (aucun en phase C) — jamais d'intention de paiement.
+    // collectedAmount provient des paiements CONFIRMÉS — jamais d'intention de paiement.
     return res.json({
       teamId: view.teamId,
       promotionId: view.promotionId,
@@ -3876,7 +3929,7 @@ function sanitizeTeamMessageText(textInput) {
   return text;
 }
 
-function tryFinalizeTeamPurchase(teamIdInput) {
+async function tryFinalizeTeamPurchase(teamIdInput) {
   const teamId = parseInt(teamIdInput, 10);
   if (!teamId || Number.isNaN(teamId)) return { ok: false, reason: 'invalid_team' };
 
@@ -3912,7 +3965,7 @@ function tryFinalizeTeamPurchase(teamIdInput) {
     // garder collectedAmount cohérent
     if (Number(team.collectedAmount) !== confirmedSum) {
       teams[tIdx] = { ...team, collectedAmount: confirmedSum };
-      writeJSONFile(TEAM_PURCHASES_FILE, teams);
+      if ((await writeJSONFile(TEAM_PURCHASES_FILE, teams)) === false) throw new Error('team_finalize_write_error');
     }
     return { ok: false, reason: 'not_funded', collectedAmount: confirmedSum };
   }
@@ -3924,7 +3977,7 @@ function tryFinalizeTeamPurchase(teamIdInput) {
     : null;
   if (existingTeamOrder) {
     teams[tIdx] = { ...team, collectedAmount: confirmedSum, status: 'completed', finalOrderId: existingTeamOrder.id };
-    writeJSONFile(TEAM_PURCHASES_FILE, teams);
+    if ((await writeJSONFile(TEAM_PURCHASES_FILE, teams)) === false) throw new Error('team_finalize_write_error');
     return { ok: true, reason: 'existing_order_linked', finalOrderId: existingTeamOrder.id };
   }
 
@@ -4004,9 +4057,11 @@ function tryFinalizeTeamPurchase(teamIdInput) {
 
   const allOrders = Array.isArray(orders) ? orders : [];
   allOrders.push(finalOrder);
-  writeJSONFile(ORDERS_FILE, allOrders);
+  // Écriture commande CRITIQUE : ne jamais marquer l'équipe complétée si la commande n'est pas persistée.
+  if ((await writeJSONFile(ORDERS_FILE, allOrders)) === false) throw new Error('team_finalize_order_write_error');
 
-  // Mettre à jour l'équipe (si cette écriture échoue après commande, la garde doublon reliera)
+  // Mettre à jour l'équipe. Si cette écriture échoue après commande persistée, la garde doublon
+  // (commande team_purchase existante) reliera au prochain appel (reprise idempotente, sans nouveau paiement).
   teams[tIdx] = {
     ...team,
     collectedAmount: confirmedSum,
@@ -4016,7 +4071,7 @@ function tryFinalizeTeamPurchase(teamIdInput) {
     goalNotifiedAt: team.goalNotifiedAt || nowIso,
     orderNotifiedAt: team.orderNotifiedAt || nowIso,
   };
-  writeJSONFile(TEAM_PURCHASES_FILE, teams);
+  if ((await writeJSONFile(TEAM_PURCHASES_FILE, teams)) === false) throw new Error('team_finalize_write_error');
 
   // Notifications (best-effort, idempotence finale protège contre doublons d'ordre; garde persistée orderNotifiedAt/goalNotifiedAt).
   try { io.emit('payment_update', { teamId: String(teamId), orderId: String(finalOrderId), status: 'completed' }); } catch (_) {}
@@ -4436,7 +4491,7 @@ function buildPromotionSavingsPlanView(plan, payments) {
 }
 
 function tryFinalizePromotionSavingsPlan(planIdInput) {
-  return runPromotionSavingsSerialized(() => {
+  return runPromotionSavingsSerialized(async () => {
     try {
       const planId = normalizePositiveInt(planIdInput);
       if (!planId) return { ok: false, reason: 'invalid_plan' };
@@ -4507,7 +4562,7 @@ function tryFinalizePromotionSavingsPlan(planIdInput) {
       });
       // Ecriture commande critique: si elle echoue, ne JAMAIS marquer le plan complete.
       let ordersWritten = false;
-      try { ordersWritten = (writeJSONFile(ORDERS_FILE, arrOrdersRe) !== false); } catch (oe) { console.error('savings finalize: order write threw:', oe && oe.message ? oe.message : oe); ordersWritten = false; }
+      try { ordersWritten = ((await writeJSONFile(ORDERS_FILE, arrOrdersRe)) === true); } catch (oe) { console.error('savings finalize: order write threw:', oe && oe.message ? oe.message : oe); ordersWritten = false; }
       if (!ordersWritten) { console.error('savings finalize: order write failed, plan kept non-completed'); throw new Error('savings_order_write_error'); }
       // La commande finale est enregistree: marquer le plan complete. Si cette ecriture echoue, la commande reste source de verite et la prochaine tentative reliera via idempotence.
       plans[idx] = { ...plans[idx], collectedAmount: confirmedSum, remainingAmount: 0, status: 'completed', finalOrderId, completedAt: nowIso, updatedAt: nowIso, goalNotifiedAt: plan.goalNotifiedAt || nowIso, orderNotifiedAt: plan.orderNotifiedAt || nowIso };
