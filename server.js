@@ -2541,6 +2541,84 @@ app.get('/api/admin/certification-info', authenticateToken, requireAdmin, (req, 
   }
 });
 
+// ===== User certification info routes (non-admin) =====
+// POST /api/users/certification-info - Save or update user's certification request
+app.post('/api/users/certification-info', authenticateToken, (req, res) => {
+  try {
+    const { boutiqueNom, rectoCiUrl, versoCiUrl, lieu, photoVendeurUrl, telephone } = req.body;
+    const userId = req.user.id;
+
+    if (!boutiqueNom || !rectoCiUrl || !versoCiUrl || !lieu || !photoVendeurUrl || !telephone) {
+      return res.status(400).json({ error: 'Tous les champs sont obligatoires' });
+    }
+
+    const data = readJSONFile(CERTIFICATION_INFO_FILE);
+
+    // Check if user already has a certification request
+    const existingIndex = data.findIndex((item) => item.userId === userId);
+
+    const certificationInfo = {
+      boutiqueNom,
+      rectoCiUrl,
+      versoCiUrl,
+      lieu,
+      photoVendeurUrl,
+      telephone,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (existingIndex !== -1) {
+      // Update existing request (preserve id and createdAt)
+      const existing = data[existingIndex];
+      // Don't allow modification if already processed/approved by admin (status field)
+      if (existing.status === 'approved') {
+        return res.status(400).json({ error: 'Cette demande a déjà été approuvée et ne peut plus être modifiée' });
+      }
+      data[existingIndex] = {
+        ...existing,
+        ...certificationInfo,
+      };
+      writeJSONFile(CERTIFICATION_INFO_FILE, data);
+      return res.json({ success: true, data: data[existingIndex], updated: true });
+    }
+
+    // Create new request
+    const newInfo = {
+      id: Date.now(),
+      userId,
+      ...certificationInfo,
+      createdAt: new Date().toISOString(),
+      status: 'pending',
+    };
+
+    data.push(newInfo);
+    writeJSONFile(CERTIFICATION_INFO_FILE, data);
+
+    res.status(201).json({ success: true, data: newInfo });
+  } catch (error) {
+    console.error('Save user certification info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/users/certification-info - Get current user's certification request
+app.get('/api/users/certification-info', authenticateToken, (req, res) => {
+  try {
+    const userId = req.user.id;
+    const data = readJSONFile(CERTIFICATION_INFO_FILE);
+    const userRequest = data.find((item) => item.userId === userId);
+
+    if (!userRequest) {
+      return res.status(404).json({ error: 'Aucune demande de certification trouvée' });
+    }
+
+    res.json(userRequest);
+  } catch (error) {
+    console.error('Get user certification info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.post('/api/users/certify-seller/init', authenticateToken, async (req, res) => {
   try {
     const payload = {
