@@ -260,7 +260,14 @@ if (!JWT_SECRET) {
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, res, buf) => {
+    if (req.path === '/api/payment/geniuspay/webhook') {
+      req.rawBody = buf;
+    }
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Multer for uploads images
@@ -3110,28 +3117,55 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/payment/geniuspay/webhook', async (req, res) => {
-  const signature = req.headers['x-webhook-signature'];
-  const timestamp = req.headers['x-webhook-timestamp'];
-  const payload = JSON.stringify(req.body);
+  const signature = req.headers['x-webhook-signature'] || req.headers['X-Webhook-Signature'] || '';
+  const timestamp = req.headers['x-webhook-timestamp'] || req.headers['X-Webhook-Timestamp'] || '';
   const secret = process.env.GENIUS_WEBHOOK_SECRET;
+
+  if (!secret) {
+    console.error('GENIUS_WEBHOOK_SECRET manquant');
+    return res.sendStatus(500);
+  }
+
+  // Corps brut capturé par le middleware verify
+  const rawBody = req.rawBody;
+  if (!rawBody || rawBody.length === 0) {
+    return res.sendStatus(400);
+  }
+
+  // Gérer format signature: "t=...,v1=..." ou hex simple
+  let signatureHex = signature;
+  if (signature.includes('v1=')) {
+    const match = signature.match(/v1=([a-f0-9]+)/i);
+    signatureHex = match ? match[1] : '';
+  }
 
   const expected = crypto
     .createHmac('sha256', secret)
-    .update(timestamp + '.' + payload)
+    .update(`${timestamp}.${rawBody}`)
     .digest('hex');
 
-  if (signature !== expected) {
+  const sigBuf = Buffer.from(signatureHex);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
     return res.sendStatus(401);
   }
 
-  const event = req.body.event;
-  const metadata = req.body.data?.metadata || {};
+  // Parser APRÈS vérification
+  let body;
+  try {
+    body = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return res.sendStatus(400);
+  }
+
+  const event = body.event;
+  const metadata = body.data?.metadata || {};
   const orderId = metadata.order_id;
   const paymentType = metadata.payment_type; // 'order' | 'seller_certification' | 'team_contribution' | 'promotion_savings_contribution'
   const contributionId = metadata.contribution_id;
   const webhookReference =
-    (req.body.data && (req.body.data.reference || req.body.data.payment_reference || req.body.data.transaction_reference)) ||
-    req.body.reference ||
+    (body.data && (body.data.reference || body.data.payment_reference || body.data.transaction_reference)) ||
+    body.reference ||
     metadata.reference ||
     null;
 
@@ -3203,7 +3237,7 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
           const sameRef = typeof contribution.transactionReference === 'string' && contribution.transactionReference === refStr;
 
           // Montant confirmé doit correspondre exactement au montant enregistré (si fourni par GeniusPay)
-          const webhookAmountRaw = req.body.data && (req.body.data.amount ?? req.body.data.paid_amount ?? (req.body.data.payment && req.body.data.payment.amount));
+          const webhookAmountRaw = body.data && (body.data.amount ?? body.data.paid_amount ?? (body.data.payment && body.data.payment.amount));
           const webhookAmount = webhookAmountRaw != null ? Number(webhookAmountRaw) : null;
           const recordedAmount = Number(contribution.amount);
           const amountOk = webhookAmount == null ? true : (Number.isFinite(webhookAmount) && Number.isFinite(recordedAmount) && webhookAmount === recordedAmount);
@@ -3317,7 +3351,7 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
         if (!planIdMeta || !userIdMeta || !contribIdMeta || !refStrS) {
           console.warn('Promotion savings webhook: identifiants/reference manquants');
         } else {
-          const webhookAmountRawS = req.body.data && (req.body.data.amount ?? req.body.data.paid_amount ?? (req.body.data.payment && req.body.data.payment.amount));
+          const webhookAmountRawS = body.data && (body.data.amount ?? body.data.paid_amount ?? (body.data.payment && body.data.payment.amount));
           const webhookAmountS = webhookAmountRawS != null ? Number(webhookAmountRawS) : null;
           let savingsFinalizeTarget = null;
           await runPromotionSavingsSerialized(() => {
