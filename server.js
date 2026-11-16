@@ -182,6 +182,62 @@ function resolveFcmUsersByIds(userIds, usersArray) {
   }
 }
 
+// ===== NOTIFICATIONS PERSISTANTES =====
+// Crée une notification persistante pour un utilisateur, avec déduplication par sourceEventId.
+// Non bloquant : n'interrompt pas le flux métier si l'écriture échoue.
+async function createNotification(userId, type, title, message, data = {}, sourceEventId) {
+  try {
+    if (!userId || !type || !title || !message) {
+      console.warn('createNotification: paramètres manquants', { userId, type, title: !!title, message: !!message });
+      return false;
+    }
+    const targetUserId = parseInt(userId, 10);
+    if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+      console.warn('createNotification: userId invalide', { userId });
+      return false;
+    }
+
+    // Vérifier que l'utilisateur existe
+    const users = readJSONFile(USERS_FILE);
+    const user = users.find((u) => parseInt(u.id, 10) === targetUserId);
+    if (!user) {
+      console.warn('createNotification: utilisateur introuvable', { userId: targetUserId });
+      return false;
+    }
+
+    // Déduplication par sourceEventId (résiste aux redémarrages)
+    if (sourceEventId) {
+      const existingNotifications = readJSONFile(NOTIFICATIONS_FILE);
+      const duplicate = existingNotifications.find(
+        (n) => parseInt(n.userId, 10) === targetUserId && n.sourceEventId === sourceEventId
+      );
+      if (duplicate) {
+        return true; // Déjà notifié pour cet événement
+      }
+    }
+
+    const notification = {
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      userId: targetUserId,
+      type,
+      title,
+      message,
+      data,
+      read: false,
+      createdAt: new Date().toISOString(),
+      sourceEventId: sourceEventId || null,
+    };
+
+    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+    notifications.push(notification);
+    await writeJSONFile(NOTIFICATIONS_FILE, notifications);
+    return true;
+  } catch (error) {
+    console.error('createNotification error:', error && error.message ? error.message : error);
+    return false;
+  }
+}
+
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
@@ -337,6 +393,7 @@ const TEAM_MESSAGES_FILE = path.join(JSON_STORAGE_DIR, 'team_messages.json');
 const PROMOTION_SAVINGS_FILE = path.join(JSON_STORAGE_DIR, 'promotion_savings.json');
 const PROMOTION_SAVINGS_PAYMENTS_FILE = path.join(JSON_STORAGE_DIR, 'promotion_savings_payments.json');
 const PASSWORD_RESULTS_FILE = path.join(JSON_STORAGE_DIR, 'password_resets.json');
+const NOTIFICATIONS_FILE = path.join(JSON_STORAGE_DIR, 'notifications.json');
 
 const ensureJSONFilesDir = () => {
   try {
@@ -531,6 +588,10 @@ const initializeData = () => {
   // Dédup webhooks GeniusPay (persistant) : init idempotente, ne jamais écraser un fichier existant.
   if (!fs.existsSync(WEBHOOK_EVENTS_FILE)) {
     try { fs.writeFileSync(WEBHOOK_EVENTS_FILE, JSON.stringify([], null, 2), 'utf8'); } catch (e) { console.error('Init WEBHOOK_EVENTS_FILE error:', e && e.message ? e.message : e); }
+  }
+  // Notifications persistantes : init idempotente
+  if (!fs.existsSync(NOTIFICATIONS_FILE)) {
+    try { fs.writeFileSync(NOTIFICATIONS_FILE, JSON.stringify([], null, 2), 'utf8'); } catch (e) { console.error('Init NOTIFICATIONS_FILE error:', e && e.message ? e.message : e); }
   }
 };
 
@@ -1737,6 +1798,11 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, async (req, res) 
       console.log('No FCM token for buyer, skipping notification');
     }
 
+    // Notification persistante pour l'acheteur - livraison confirmée
+    if (buyer) {
+      await createNotification(buyerId, 'delivery_confirmed', 'Livraison confirmée !', `Vous avez confirmé la réception de votre commande #${order.id}. Merci d'avoir choisi DJASSACI !`, { orderId: order.id, nomLivraison: order.nomLivraison }, `delivery_confirmed:${order.id}`);
+    }
+
     res.json({
       message: 'Livraison confirmée! Notification envoyée à l\'acheteur.',
       order,
@@ -1747,7 +1813,7 @@ app.put('/api/orders/:id/confirm-delivery', authenticateToken, async (req, res) 
   }
 });
 
-app.post('/api/orders', authenticateToken, (req, res) => {
+app.post('/api/orders', authenticateToken, async (req, res) => {
   try {
     const { items, paymentMethod, phoneNumber, accountName, nomLivraison, telLivraison, villeCommune, quartier } = req.body;
 
@@ -1831,6 +1897,21 @@ app.post('/api/orders', authenticateToken, (req, res) => {
 
     orders.push(newOrder);
     writeJSONFile(ORDERS_FILE, orders);
+
+    // Notifications persistantes pour les vendeurs - nouvelle commande reçue
+    const sellerIds = new Set();
+    validatedItems.forEach((item) => {
+      if (item.seller) {
+        sellerIds.add(parseInt(item.seller, 10));
+      }
+    });
+    const usersForNotif = readJSONFile(USERS_FILE);
+    for (const sellerId of sellerIds) {
+      const seller = usersForNotif.find((u) => parseInt(u.id, 10) === sellerId);
+      if (seller) {
+        await createNotification(sellerId, 'order_created', 'Nouvelle commande reçue', `Vous avez reçu une nouvelle commande #${newOrder.id}.`, { orderId: newOrder.id, total: newOrder.total }, `order_created:${newOrder.id}:${sellerId}`);
+      }
+    }
 
     res.status(201).json({
       message: 'Order placed successfully',
@@ -2493,6 +2574,130 @@ app.put('/api/users/fcm-token', authenticateToken, (req, res) => {
     res.json({ message: 'FCM token saved' });
   } catch (error) {
     console.error('FCM token save error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ===== NOTIFICATIONS PERSISTANTES (API JWT) =====
+// GET /api/notifications — Liste paginée des notifications de l'utilisateur connecté
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.user.id, 10);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const offset = parseInt(req.query.offset, 10) || 0;
+
+    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+    const userNotifications = notifications
+      .filter((n) => parseInt(n.userId, 10) === userId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(offset, offset + limit);
+
+    res.json({
+      notifications: userNotifications,
+      total: notifications.filter((n) => parseInt(n.userId, 10) === userId).length,
+      limit,
+      offset,
+    });
+  } catch (error) {
+    console.error('Get notifications error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/notifications/unread-count — Nombre de notifications non lues
+app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.user.id, 10);
+    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+    const unreadCount = notifications.filter(
+      (n) => parseInt(n.userId, 10) === userId && n.read === false
+    ).length;
+    res.json({ unreadCount });
+  } catch (error) {
+    console.error('Get unread count error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PUT /api/notifications/:id/read — Marquer une notification comme lue
+app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.user.id, 10);
+    const notificationId = parseInt(req.params.id, 10);
+
+    if (!Number.isFinite(notificationId)) {
+      return res.status(400).json({ error: 'Identifiant de notification invalide' });
+    }
+
+    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+    const index = notifications.findIndex(
+      (n) => n.id === notificationId && parseInt(n.userId, 10) === userId
+    );
+
+    if (index === -1) {
+      return res.status(404).json({ error: 'Notification introuvable' });
+    }
+
+    notifications[index] = { ...notifications[index], read: true };
+    await writeJSONFile(NOTIFICATIONS_FILE, notifications);
+
+    res.json({ message: 'Notification marquée comme lue', notification: notifications[index] });
+  } catch (error) {
+    console.error('Mark notification read error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PUT /api/notifications/read-all — Marquer toutes les notifications comme lues
+app.put('/api/notifications/read-all', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.user.id, 10);
+    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+
+    let modified = false;
+    for (let i = 0; i < notifications.length; i++) {
+      if (parseInt(notifications[i].userId, 10) === userId && notifications[i].read === false) {
+        notifications[i] = { ...notifications[i], read: true };
+        modified = true;
+      }
+    }
+
+    if (modified) {
+      await writeJSONFile(NOTIFICATIONS_FILE, notifications);
+    }
+
+    res.json({ message: 'Toutes les notifications marquées comme lues' });
+  } catch (error) {
+    console.error('Mark all notifications read error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/notifications/:id — Supprimer une notification
+app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.user.id, 10);
+    const notificationId = parseInt(req.params.id, 10);
+
+    if (!Number.isFinite(notificationId)) {
+      return res.status(400).json({ error: 'Identifiant de notification invalide' });
+    }
+
+    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+    const index = notifications.findIndex(
+      (n) => n.id === notificationId && parseInt(n.userId, 10) === userId
+    );
+
+    if (index === -1) {
+      return res.status(404).json({ error: 'Notification introuvable' });
+    }
+
+    notifications.splice(index, 1);
+    await writeJSONFile(NOTIFICATIONS_FILE, notifications);
+
+    res.json({ message: 'Notification supprimée' });
+  } catch (error) {
+    console.error('Delete notification error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -3281,6 +3486,14 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                     if (_creU && _creU.fcmToken && parseInt(_creU.id,10)!==parseInt(_partU&&_partU.id,10)) sendFcmToToken(_creU.fcmToken,{title:"Contribution confirmée",body:"Une contribution a été confirmée dans votre équipe.",type:"team_contribution_confirmed",data:{teamId:String(teamIdMeta),contributionId:String(contribution.paymentId||contributionIdMeta)}}).catch(()=>{});
                   } catch (_) {}
 
+                  // Notifications persistantes
+                  if (_partU) {
+                    await createNotification(_partU.id, 'team_contribution_confirmed', 'Contribution confirmée', `Votre contribution de ${contribution.amount.toLocaleString()} FCFA pour l'équipe #${teamIdMeta} a été confirmée.`, { teamId: teamIdMeta, contributionId: contribution.paymentId || contributionIdMeta, amount: contribution.amount }, `team_contribution:${teamIdMeta}:${contribution.paymentId || contributionIdMeta}:confirmed`);
+                  }
+                  if (_creU && _creU.id !== _partU?.id) {
+                    await createNotification(_creU.id, 'team_contribution_confirmed', 'Nouvelle contribution confirmée', `Une contribution de ${contribution.amount.toLocaleString()} FCFA a été confirmée dans votre équipe #${teamIdMeta}.`, { teamId: teamIdMeta, contributionId: contribution.paymentId || contributionIdMeta, amount: contribution.amount }, `team_contribution:${teamIdMeta}:${contribution.paymentId || contributionIdMeta}:confirmed:creator`);
+                  }
+
                   // Recalculer collectedAmount UNIQUEMENT depuis contributions confirmées (mémoire, évite race lecture/écriture async)
                   const confirmedSum = allPayments
                     .filter((p) => p && parseInt(p.teamId, 10) === teamIdMeta && p.paymentStatus === 'confirmed')
@@ -3318,6 +3531,13 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                     const _partU = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===parseInt(contribution.participantId,10));
                     if (_partU && _partU.fcmToken) sendFcmToToken(_partU.fcmToken,{title:"Contribution échouée",body:"Votre paiement n'a pas été confirmé.",type:"team_contribution_failed",data:{teamId:String(teamIdMeta),contributionId:String(contribution.paymentId||contributionIdMeta)}}).catch(()=>{});
                   } catch (_) {}
+
+                  // Notification persistante
+                  const _partU2 = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===parseInt(contribution.participantId,10));
+                  if (_partU2) {
+                    await createNotification(_partU2.id, 'team_contribution_failed', 'Contribution échouée', `Le paiement de votre contribution de ${contribution.amount.toLocaleString()} FCFA pour l'équipe #${teamIdMeta} a échoué.`, { teamId: teamIdMeta, contributionId: contribution.paymentId || contributionIdMeta, amount: contribution.amount }, `team_contribution:${teamIdMeta}:${contribution.paymentId || contributionIdMeta}:failed`);
+                  }
+
                   // Réservation libérée (n'est plus pending/initializing). collectedAmount reste basé sur confirmed uniquement.
                 }
               }
@@ -3354,7 +3574,7 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
           const webhookAmountRawS = body.data && (body.data.amount ?? body.data.paid_amount ?? (body.data.payment && body.data.payment.amount));
           const webhookAmountS = webhookAmountRawS != null ? Number(webhookAmountRawS) : null;
           let savingsFinalizeTarget = null;
-          await runPromotionSavingsSerialized(() => {
+await runPromotionSavingsSerialized(async () => {
             try {
               const paysL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_PAYMENTS_FILE);
               const plansL = loadPromotionSavingsFileSafe(PROMOTION_SAVINGS_FILE);
@@ -3387,6 +3607,13 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                     const _ownerU = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===userIdMeta);
                     if (_ownerU && _ownerU.fcmToken) sendFcmToToken(_ownerU.fcmToken,{title:"Versement confirmé",body:"Votre versement a été confirmé.",type:"savings_contribution_confirmed",data:{planId:String(planIdMeta),contributionId:String(contribIdMeta)}}).catch(()=>{});
                   } catch (_) {}
+
+                  // Notification persistante
+                  const _ownerU2 = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===userIdMeta);
+                  if (_ownerU2) {
+                    await createNotification(_ownerU2.id, 'savings_contribution_confirmed', 'Versement confirmé', `Votre versement de ${contrib.amount.toLocaleString()} FCFA pour votre objectif d'épargne #${planIdMeta} a été confirmé.`, { planId: planIdMeta, contributionId: contribIdMeta, amount: contrib.amount }, `savings_contribution:${planIdMeta}:${contribIdMeta}:confirmed`);
+                  }
+
                   const confirmedSumS = roundMoney2(allSP
                     .filter((p) => p && parseInt(p.planId, 10) === planIdMeta && p.paymentStatus === 'confirmed')
                     .reduce((sum, p) => sum + (Number(p.amount) || 0), 0));
@@ -3409,6 +3636,12 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                       const _ownerUF = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===userIdMeta);
                       if (_ownerUF && _ownerUF.fcmToken) sendFcmToToken(_ownerUF.fcmToken,{title:"Versement echoue",body:"Votre paiement n'a pas ete confirme.",type:"savings_contribution_failed",data:{planId:String(planIdMeta),contributionId:String(contribIdMeta)}}).catch(()=>{});
                     } catch (_) {}
+
+                    // Notification persistante
+                    const _ownerUF2 = (readJSONFile(USERS_FILE) || []).find((u)=>parseInt(u&&u.id,10)===userIdMeta);
+                    if (_ownerUF2) {
+                      await createNotification(_ownerUF2.id, 'savings_contribution_failed', 'Versement échoué', `Le paiement de votre versement de ${contrib.amount.toLocaleString()} FCFA pour votre objectif d'épargne #${planIdMeta} a échoué.`, { planId: planIdMeta, contributionId: contribIdMeta, amount: contrib.amount }, `savings_contribution:${planIdMeta}:${contribIdMeta}:failed`);
+                    }
                   }
                 }
               }
@@ -3465,6 +3698,8 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
               type: 'payment_confirmed',
               data: { orderId: String(orders[index].id) },
             }).catch(() => {});
+            // Notification persistante
+            await createNotification(buyerId, 'payment_confirmed', 'Paiement confirmé !', `Votre paiement de ${orders[index].total.toLocaleString()} FCFA pour la commande #${orderNumber} a été validé avec succès.`, { orderId: orders[index].id, amount: orders[index].total }, `payment:order:${orderNumber}:success`);
           } else if (event === 'payment.failed') {
             sendFcmToToken(buyer.fcmToken, {
               title: 'Paiement échoué',
@@ -3472,6 +3707,8 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
               type: 'payment_failed',
               data: { orderId: String(orders[index].id) },
             }).catch(() => {});
+            // Notification persistante
+            await createNotification(buyerId, 'payment_failed', 'Paiement échoué', `Le paiement de votre commande #${orderNumber} a échoué.`, { orderId: orders[index].id }, `payment:order:${orderNumber}:failed`);
           }
         }
       }
@@ -3512,6 +3749,11 @@ app.post('/api/payment/geniuspay/webhook', async (req, res) => {
                   sellerVerifiedUntil: until.toISOString(),
                 },
               }).catch(() => {});
+            }
+
+            // Notification persistante
+            if (seller) {
+              await createNotification(seller.id, 'seller_certified', 'Boutique certifiée !', 'Votre certification vendeur est activée pour 30 jours.', { sellerVerifiedUntil: until.toISOString() }, `seller_certified:${seller.id}:${Date.now()}`);
             }
           }
         }
@@ -3564,7 +3806,7 @@ app.get('/api/admin/audit-log', authenticateToken, requireAdmin, (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-app.put('/api/orders/:id/pay-vendor', authenticateToken, (req, res) => {
+app.put('/api/orders/:id/pay-vendor', authenticateToken, async (req, res) => {
   const orderId = parseInt(req.params.id);
   const orders = readJSONFile(ORDERS_FILE);
   const orderIndex = orders.findIndex((o) => o.id === orderId);
@@ -3576,10 +3818,28 @@ app.put('/api/orders/:id/pay-vendor', authenticateToken, (req, res) => {
   orders[orderIndex].statutVendeur = 'paye_vendeur';
   writeJSONFile(ORDERS_FILE, orders);
 
+  // Notification persistante pour le vendeur - paiement au vendeur confirmé
+  const order = orders[orderIndex];
+  const products = readJSONFile(PRODUCTS_FILE);
+  const sellerIds = new Set();
+  order.articles.forEach((article) => {
+    const product = products.find((p) => p.id === article.product?.id || p.id === article.id);
+    if (product && product.vendeur) {
+      sellerIds.add(parseInt(product.vendeur, 10));
+    }
+  });
+  const users = readJSONFile(USERS_FILE);
+  for (const sellerId of sellerIds) {
+    const seller = users.find((u) => parseInt(u.id, 10) === sellerId);
+    if (seller) {
+      await createNotification(sellerId, 'order_vendor_paid', 'Paiement vendeur reçu', `Le paiement pour votre commande #${orderId} a été reçu.`, { orderId, total: order.total }, `order_vendor_paid:${orderId}:${sellerId}`);
+    }
+  }
+
   res.json({ message: 'Vendeur payé', order: orders[orderIndex] });
 });
 
-app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
+app.put('/api/orders/:id/deliver', authenticateToken, async (req, res) => {
   try {
     const orderId = parseInt(req.params.id);
     const orders = readJSONFile(ORDERS_FILE);
@@ -3608,6 +3868,14 @@ app.put('/api/orders/:id/deliver', authenticateToken, (req, res) => {
 
     order.statut = 'livree';
     writeJSONFile(ORDERS_FILE, orders);
+
+    // Notification persistante pour l'acheteur - commande marquée comme livrée
+    const buyerId = order.utilisateurId;
+    const users = readJSONFile(USERS_FILE);
+    const buyer = users.find((u) => u.id == buyerId);
+    if (buyer) {
+      await createNotification(buyerId, 'delivery_marked', 'Commande livrée', `Votre commande #${orderId} a été marquée comme livrée par le vendeur.`, { orderId, statut: 'livree' }, `delivery_marked:${orderId}`);
+    }
 
     res.json({ message: 'Commande marquée comme livrée', order });
   } catch (error) {
@@ -3847,7 +4115,7 @@ function buildTeamView(team) {
 }
 
 // POST /api/teams — créer une équipe depuis une promotion (bénéficiaire = créateur)
-app.post('/api/teams', authenticateToken, (req, res) => {
+app.post('/api/teams', authenticateToken, async (req, res) => {
   try {
     const promotionId = parseInt(req.body.promotionId, 10);
     if (!promotionId || Number.isNaN(promotionId)) {
@@ -3916,6 +4184,10 @@ app.post('/api/teams', authenticateToken, (req, res) => {
       if (creatorUser && creatorUser.fcmToken) {
         sendFcmToToken(creatorUser.fcmToken, { title: 'Equipe creee', body: 'Votre equipe d\'achat a ete creee. Partagez le code d\'invitation.', type: 'team_created', data: { teamId: String(team.teamId) } }).catch(() => {});
       }
+      // Notification persistante
+      if (creatorUser) {
+        await createNotification(creatorUser.id, 'team_created', 'Équipe créée !', `Votre équipe d'achat #${team.teamId} a été créée. Partagez le code d'invitation.`, { teamId: team.teamId }, `team_created:${team.teamId}`);
+      }
     } catch (_) {}
 
     return res.status(201).json({ message: 'Équipe créée', team: buildTeamView(team) });
@@ -3965,7 +4237,7 @@ app.get('/api/teams/:id', authenticateToken, async (req, res) => {
 });
 
 // POST /api/teams/:id/join — rejoindre une équipe ouverte (PHASE C)
-app.post('/api/teams/:id/join', authenticateToken, (req, res) => {
+app.post('/api/teams/:id/join', authenticateToken, async (req, res) => {
   try {
     const teamId = parseInt(req.params.id, 10);
     if (!teamId || Number.isNaN(teamId)) {
@@ -4051,6 +4323,18 @@ app.post('/api/teams/:id/join', authenticateToken, (req, res) => {
       }
     } catch (_) {}
 
+    // Notifications persistantes pour les membres existants
+    const existingMembers = (Array.isArray(team.participants) ? team.participants : [])
+      .map((p) => parseInt(p && p.userId, 10))
+      .filter((id) => Number.isFinite(id) && id > 0 && id !== userId);
+    const usersForNotif = readJSONFile(USERS_FILE) || [];
+    for (const memberId of existingMembers) {
+      const member = usersForNotif.find((u) => parseInt(u && u.id, 10) === memberId);
+      if (member) {
+        await createNotification(member.id, 'team_participant_joined', 'Nouvel équipier !', `Un nouveau membre a rejoint votre équipe d'achat #${teamId}.`, { teamId }, `team_participant_joined:${teamId}:${memberId}`);
+      }
+    }
+
     return res.json({ message: 'Participation enregistrée', team: buildTeamView(updatedTeam) });
   } catch (error) {
     console.error('Join team error:', error);
@@ -4059,7 +4343,7 @@ app.post('/api/teams/:id/join', authenticateToken, (req, res) => {
 });
 
 // POST /api/teams/join-by-code — retrouver/rejoindre une équipe par code d'invitation (additif, navigation/UI)
-app.post('/api/teams/join-by-code', authenticateToken, (req, res) => {
+app.post('/api/teams/join-by-code', authenticateToken, async (req, res) => {
   try {
     const rawCode = req.body && (req.body.invitationCode || req.body.code);
     const code = typeof rawCode === 'string' ? rawCode.trim() : '';
@@ -4130,6 +4414,19 @@ app.post('/api/teams/join-by-code', authenticateToken, (req, res) => {
         sendFcmToUsers(recipients, { title: 'Nouvel equipier !', body: "Un nouveau membre vient de rejoindre votre equipe d'achat.", type: 'team_participant_joined', data: { teamId: String(teamId) } }).catch(() => {});
       }
     } catch (_) {}
+
+    // Notifications persistantes pour les membres existants
+    const existingMembers = (Array.isArray(team.participants) ? team.participants : [])
+      .map((p) => parseInt(p && p.userId, 10))
+      .filter((id) => Number.isFinite(id) && id > 0 && id !== userId);
+    const usersForNotif = readJSONFile(USERS_FILE) || [];
+    for (const memberId of existingMembers) {
+      const member = usersForNotif.find((u) => parseInt(u && u.id, 10) === memberId);
+      if (member) {
+        await createNotification(member.id, 'team_participant_joined', 'Nouvel équipier !', `Un nouveau membre a rejoint votre équipe d'achat #${teamId}.`, { teamId }, `team_participant_joined:${teamId}:${memberId}`);
+      }
+    }
+
     return res.json({ message: 'Participation enregistrée', team: buildTeamView(updatedTeam) });
   } catch (error) {
     console.error('Join team by code error:', error);
@@ -4514,11 +4811,21 @@ async function tryFinalizeTeamPurchase(teamIdInput) {
     const _byId = new Map(_users.map((u)=>[parseInt(u&&u.id,10),u]));
     for (const uid of _allParts) {
       const u = _byId.get(uid); if (!u || !u.fcmToken) continue;
-      if (!team.goalNotifiedAt) sendFcmToToken(u.fcmToken,{title:"Objectif atteint",body:"L'objectif de l'équipe est atteint.",type:"team_goal_reached",data:{teamId:String(teamId)}}).catch(()=>{});
+      if (!team.goalNotifiedAt) {
+        sendFcmToToken(u.fcmToken,{title:"Objectif atteint",body:"L'objectif de l'équipe est atteint.",type:"team_goal_reached",data:{teamId:String(teamId)}}).catch(()=>{});
+        // Notification persistante
+        await createNotification(u.id, 'team_goal_reached', 'Objectif atteint !', `L'objectif de l'équipe #${teamId} a été atteint.`, { teamId }, `team_goal_reached:${teamId}:${u.id}`);
+      }
       if (!team.orderNotifiedAt) {
         sendFcmToToken(u.fcmToken,{title:"Commande créée",body:`Commande #${finalOrderId} créée pour votre équipe.`,type:"team_order_created",data:{teamId:String(teamId),orderId:String(finalOrderId)}}).catch(()=>{});
+        // Notification persistante
+        await createNotification(u.id, 'team_order_created', 'Commande créée', `La commande #${finalOrderId} a été créée pour votre équipe #${teamId}.`, { teamId, orderId: finalOrderId }, `team_order_created:${teamId}:${finalOrderId}:${u.id}`);
         // compat existant (créateur / clients historiques)
-        if (uid === parseInt(creatorId,10)) sendFcmToToken(u.fcmToken,{title:"Achat en équipe réussi",body:`Objectif atteint ! Votre commande #${finalOrderId} a été créée.`,type:"team_purchase_completed",data:{orderId:String(finalOrderId),teamId:String(teamId)}}).catch(()=>{});
+        if (uid === parseInt(creatorId,10)) {
+          sendFcmToToken(u.fcmToken,{title:"Achat en équipe réussi",body:`Objectif atteint ! Votre commande #${finalOrderId} a été créée.`,type:"team_purchase_completed",data:{orderId:String(finalOrderId),teamId:String(teamId)}}).catch(()=>{});
+          // Notification persistante pour le créateur
+          await createNotification(u.id, 'team_purchase_completed', 'Achat en équipe réussi !', `Objectif atteint ! Votre commande #${finalOrderId} a été créée pour l'équipe #${teamId}.`, { teamId, orderId: finalOrderId }, `team_purchase_completed:${teamId}:${finalOrderId}`);
+        }
       }
     }
   } catch (_) {}
@@ -5005,10 +5312,17 @@ function tryFinalizePromotionSavingsPlan(planIdInput) {
       if (!plan.goalNotifiedAt || !plan.orderNotifiedAt) {
         try {
           if (owner && owner.fcmToken) {
-            if (!plan.goalNotifiedAt) sendFcmToToken(owner.fcmToken,{title:"Objectif atteint",body:"Votre objectif d'épargne est atteint.",type:"savings_goal_reached",data:{planId:String(planId)}}).catch(()=>{});
+            if (!plan.goalNotifiedAt) {
+              sendFcmToToken(owner.fcmToken,{title:"Objectif atteint",body:"Votre objectif d'épargne est atteint.",type:"savings_goal_reached",data:{planId:String(planId)}}).catch(()=>{});
+              // Notification persistante
+              await createNotification(owner.id, 'savings_goal_reached', 'Objectif atteint !', `Votre objectif d'épargne #${planId} a été atteint.`, { planId }, `savings_goal_reached:${planId}`);
+            }
             if (!plan.orderNotifiedAt) {
               sendFcmToToken(owner.fcmToken,{title:"Commande créée",body:`Commande #${finalOrderId} créée pour votre achat petit à petit.`,type:"savings_order_created",data:{planId:String(planId),orderId:String(finalOrderId)}}).catch(()=>{});
               sendFcmToToken(owner.fcmToken,{title:"Achat petit a petit termine",body:`Objectif atteint ! Votre commande #${finalOrderId} a ete creee.`,type:"promotion_savings_completed",data:{orderId:String(finalOrderId),planId:String(planId)}}).catch(()=>{});
+              // Notifications persistantes
+              await createNotification(owner.id, 'savings_order_created', 'Commande créée', `La commande #${finalOrderId} a été créée pour votre achat petit à petit #${planId}.`, { planId, orderId: finalOrderId }, `savings_order_created:${planId}:${finalOrderId}`);
+              await createNotification(owner.id, 'promotion_savings_completed', 'Achat petit à petit terminé !', `Objectif atteint ! Votre commande #${finalOrderId} a été créée pour votre achat petit à petit #${planId}.`, { planId, orderId: finalOrderId }, `promotion_savings_completed:${planId}:${finalOrderId}`);
             }
           }
         } catch (_) {}
@@ -5029,7 +5343,7 @@ app.post('/api/promotions/:promotionId/savings', authenticateToken, async (req, 
     if (!promotionId) return res.status(400).json({ error: 'Identifiant promotion invalide' });
     const userId = normalizePositiveInt(req.user && req.user.id);
     if (!userId) return res.status(401).json({ error: 'Utilisateur non authentifie' });
-    const result = await runPromotionSavingsSerialized(() => {
+    const result = await runPromotionSavingsSerialized(async () => {
       try {
         const promotions = readJSONFile(PROMOTIONS_FILE);
         const promotion = Array.isArray(promotions) ? promotions.find((p) => parseInt(p && p.id, 10) === promotionId) : null;
@@ -5058,6 +5372,10 @@ app.post('/api/promotions/:promotionId/savings', authenticateToken, async (req, 
           try {
             const owner = (readJSONFile(USERS_FILE) || []).find((u) => parseInt(u && u.id, 10) === userId);
             if (owner && owner.fcmToken) sendFcmToToken(owner.fcmToken, { title: 'Achat petit à petit', body: 'Votre objectif d\'épargne a été créé.', type: 'savings_plan_created', data: { planId: String(plan.planId), promotionId: String(promotionId) } }).catch(() => {});
+            // Notification persistante
+            if (owner) {
+              await createNotification(owner.id, 'savings_plan_created', 'Objectif d\'épargne créé', `Votre objectif d'épargne pour "${promotion.name || 'promotion'}" a été créé.`, { planId: plan.planId, promotionId }, `savings_plan_created:${plan.planId}`);
+            }
           } catch (_) {}
         }
         return { status: created ? 201 : 200, body: { success: true, created, plan: buildPromotionSavingsPlanView(plan, payments) } };
