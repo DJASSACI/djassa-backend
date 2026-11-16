@@ -185,7 +185,8 @@ function resolveFcmUsersByIds(userIds, usersArray) {
 // ===== NOTIFICATIONS PERSISTANTES =====
 // Crée une notification persistante pour un utilisateur, avec déduplication par sourceEventId.
 // Non bloquant : n'interrompt pas le flux métier si l'écriture échoue.
-async function createNotification(userId, type, title, message, data = {}, sourceEventId) {
+// Retourne true si créée, false si dédupliquée, lève une exception si écriture échoue.
+async function createNotification(userId, type, title, message, data = {}, sourceEventId, existingNotifications) {
   try {
     if (!userId || !type || !title || !message) {
       console.warn('createNotification: paramètres manquants', { userId, type, title: !!title, message: !!message });
@@ -206,13 +207,14 @@ async function createNotification(userId, type, title, message, data = {}, sourc
     }
 
     // Déduplication par sourceEventId (résiste aux redémarrages)
+    // Utilise le tableau passé en paramètre pour éviter TOCTOU
+    const notificationsForCheck = existingNotifications ?? readJSONFile(NOTIFICATIONS_FILE);
     if (sourceEventId) {
-      const existingNotifications = readJSONFile(NOTIFICATIONS_FILE);
-      const duplicate = existingNotifications.find(
+      const duplicate = notificationsForCheck.find(
         (n) => parseInt(n.userId, 10) === targetUserId && n.sourceEventId === sourceEventId
       );
       if (duplicate) {
-        return true; // Déjà notifié pour cet événement
+        return false; // Déjà notifié pour cet événement
       }
     }
 
@@ -228,13 +230,17 @@ async function createNotification(userId, type, title, message, data = {}, sourc
       sourceEventId: sourceEventId || null,
     };
 
-    const notifications = readJSONFile(NOTIFICATIONS_FILE);
+    // Si on a déjà lu le fichier, on l'utilise, sinon on relit
+    const notifications = existingNotifications ?? readJSONFile(NOTIFICATIONS_FILE);
     notifications.push(notification);
-    await writeJSONFile(NOTIFICATIONS_FILE, notifications);
+    const writeResult = await writeJSONFile(NOTIFICATIONS_FILE, notifications);
+    if (!writeResult) {
+      throw new Error('Échec écriture notifications.json');
+    }
     return true;
   } catch (error) {
     console.error('createNotification error:', error && error.message ? error.message : error);
-    return false;
+    throw error; // Propager l'erreur pour que l'appelant puisse la gérer
   }
 }
 
@@ -3684,32 +3690,32 @@ await runPromotionSavingsSerialized(async () => {
 
       writeJSONFile(ORDERS_FILE, orders);
 
-      if (orders[index].statut !== oldStatut) {
-        const buyerId = orders[index].utilisateurId;
-        const users = readJSONFile(USERS_FILE);
-        const buyer = users.find((u) => u.id == buyerId);
+      // Toujours tenter de créer la notification persistante (déduplication par sourceEventId)
+      const buyerId = orders[index].utilisateurId;
+      const users = readJSONFile(USERS_FILE);
+      const buyer = users.find((u) => u.id == buyerId);
 
-        if (buyer && buyer.fcmToken) {
-          const orderNumber = orders[index].id;
-          if (event === 'payment.success') {
-            sendFcmToToken(buyer.fcmToken, {
-              title: 'Paiement confirmé',
-              body: `Votre commande #${orderNumber} est payée !`,
-              type: 'payment_confirmed',
-              data: { orderId: String(orders[index].id) },
-            }).catch(() => {});
-            // Notification persistante
-            await createNotification(buyerId, 'payment_confirmed', 'Paiement confirmé !', `Votre paiement de ${orders[index].total.toLocaleString()} FCFA pour la commande #${orderNumber} a été validé avec succès.`, { orderId: orders[index].id, amount: orders[index].total }, `payment:order:${orderNumber}:success`);
-          } else if (event === 'payment.failed') {
-            sendFcmToToken(buyer.fcmToken, {
-              title: 'Paiement échoué',
-              body: `Votre commande #${orderNumber} n'a pas pu être réglée.`,
-              type: 'payment_failed',
-              data: { orderId: String(orders[index].id) },
-            }).catch(() => {});
-            // Notification persistante
-            await createNotification(buyerId, 'payment_failed', 'Paiement échoué', `Le paiement de votre commande #${orderNumber} a échoué.`, { orderId: orders[index].id }, `payment:order:${orderNumber}:failed`);
-          }
+      if (buyer && buyer.fcmToken) {
+        const orderNumber = orders[index].id;
+        const notifications = readJSONFile(NOTIFICATIONS_FILE);
+        if (event === 'payment.success') {
+          sendFcmToToken(buyer.fcmToken, {
+            title: 'Paiement confirmé',
+            body: `Votre commande #${orderNumber} est payée !`,
+            type: 'payment_confirmed',
+            data: { orderId: String(orders[index].id) },
+          }).catch(() => {});
+          // Notification persistante
+          await createNotification(buyerId, 'payment_confirmed', 'Paiement confirmé !', `Votre paiement de ${orders[index].total.toLocaleString()} FCFA pour la commande #${orderNumber} a été validé avec succès.`, { orderId: orders[index].id, amount: orders[index].total }, `payment:order:${orderNumber}:success`, notifications);
+        } else if (event === 'payment.failed') {
+          sendFcmToToken(buyer.fcmToken, {
+            title: 'Paiement échoué',
+            body: `Votre commande #${orderNumber} n'a pas pu être réglée.`,
+            type: 'payment_failed',
+            data: { orderId: String(orders[index].id) },
+          }).catch(() => {});
+          // Notification persistante
+          await createNotification(buyerId, 'payment_failed', 'Paiement échoué', `Le paiement de votre commande #${orderNumber} a échoué.`, { orderId: orders[index].id }, `payment:order:${orderNumber}:failed`, notifications);
         }
       }
     }
@@ -3751,9 +3757,11 @@ await runPromotionSavingsSerialized(async () => {
               }).catch(() => {});
             }
 
-            // Notification persistante
+            // Notification persistante - sourceEventId stable basé sur user_id + webhookReference
             if (seller) {
-              await createNotification(seller.id, 'seller_certified', 'Boutique certifiée !', 'Votre certification vendeur est activée pour 30 jours.', { sellerVerifiedUntil: until.toISOString() }, `seller_certified:${seller.id}:${Date.now()}`);
+              const notifications = readJSONFile(NOTIFICATIONS_FILE);
+              const certSourceEventId = `seller_certified:${seller.id}:${webhookReference || 'noref'}`;
+              await createNotification(seller.id, 'seller_certified', 'Boutique certifiée !', 'Votre certification vendeur est activée pour 30 jours.', { sellerVerifiedUntil: until.toISOString() }, certSourceEventId, notifications);
             }
           }
         }
